@@ -39,3 +39,12 @@ def test_page_and_leather_sizes():
 def test_page_centre_matches_widget_background():
     px = U.make_page(450, 650, False).getpixel((225, 325))
     assert px == (0xe8, 0xd9, 0xb5)   # flat centre must equal PARCH so widgets blend in
+
+
+def test_tab_images():
+    n, h, a = (U.tab_pil("Cast", "#243f73", s) for s in ("normal", "hover", "active"))
+    assert n.size == (58, 92) and h.size == (58, 92) and a.size == (68, 92)   # active tab is wider
+    assert n.tobytes() != a.tobytes()
+    assert n.getpixel((0, 46))[3] == 255           # flush, square edge against the page
+    assert n.getpixel((n.width - 1, 0))[3] == 0    # outer top corner is rounded away
+    assert n.getpixel((n.width - 1, n.height - 1))[3] == 0

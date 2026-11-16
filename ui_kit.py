@@ -92,6 +92,43 @@ def btn_image(text: str, state: str = "normal"):
     return _btn_cache[key]
 
 
+def _shade(hexcolor: str, f: float):
+    """Lighten (f>0) or darken (f<0) a #rrggbb colour; returns an (r, g, b) tuple."""
+    c = [int(hexcolor[i:i + 2], 16) for i in (1, 3, 5)]
+    return tuple(int(x + (255 - x) * f) if f >= 0 else int(x * (1 + f)) for x in c)
+
+
+def tab_pil(label: str, color: str, state: str = "normal", w: int = 58, h: int = 92) -> Image.Image:
+    """A bookmark tab: flush with the page on the left, rounded on the right, text running downward.
+
+    state: 'normal', 'hover' or 'active' (active is brighter, wider, with a lighter gold rim).
+    """
+    s, r = 3, 14
+    if state == "active":
+        w += 10
+    top, bot = {"normal": (_shade(color, .10), _shade(color, -.12)),
+                "hover": (_shade(color, .22), color and _shade(color, 0)),
+                "active": (_shade(color, .30), _shade(color, .06))}[state]
+    grad = Image.linear_gradient("L").resize((w * s, h * s))
+    fill = Image.composite(Image.new("RGB", (w * s, h * s), bot), Image.new("RGB", (w * s, h * s), top), grad)
+    shape = (-r * s - 4, 0, w * s - 1, h * s - 1)      # left corners sit off-canvas, so the left edge is square
+    mask = Image.new("L", (w * s, h * s), 0)
+    ImageDraw.Draw(mask).rounded_rectangle(shape, radius=r * s, fill=255)
+    im = Image.new("RGBA", (w * s, h * s), (0, 0, 0, 0))
+    im.paste(fill, (0, 0), mask)
+    rim = (240, 216, 120, 255) if state == "active" else (201, 162, 39, 255)
+    ImageDraw.Draw(im).rounded_rectangle(shape, radius=r * s, outline=rim, width=(3 if state == "active" else 2) * s)
+    im = im.resize((w, h), Image.LANCZOS)
+    f = pil_font(15, True)
+    bb = f.getbbox(label)
+    tw, th = bb[2] - bb[0], bb[3] - bb[1]
+    t = Image.new("RGBA", (tw + 4, th + 6), (0, 0, 0, 0))
+    ImageDraw.Draw(t).text((2 - bb[0], 3 - bb[1]), label, font=f, fill=(243, 230, 196, 255))
+    t = t.rotate(270, expand=True)
+    im.alpha_composite(t, ((w + 4 - t.width) // 2, (h - t.height) // 2))
+    return im
+
+
 class Tip:
     """Small hover tooltip."""
 

@@ -19,7 +19,7 @@ from spells_data import (CAST_STEPS, DESCRIPTIONS, SPELLS, diagram_paths, pretty
                          spell_color, spell_effect)
 from ui_kit import (CARD, CARD_EDGE, FIELD, GOLD, INK, LEATHER, PARCH, PARCH_DARK, RED, SERIF, TEXT_ON_DARK,
                     RoundButton, Tip, apply_styles, battery_color, battery_percent, ink_image, make_leather,
-                    make_page, state_color, style_titlebar)
+                    make_page, state_color, style_titlebar, tab_pil)
 from version import __version__
 
 W, H = 1000, 730
@@ -217,23 +217,25 @@ class App(tk.Tk):
 
     # ---------- book chrome ----------
     def _draw_tabs(self):
-        self.tab_ids = {}
+        self.tab_ids, self.tab_imgs = {}, {}
         for i, (key, label, col) in enumerate(TABS):
             y = BY0 + 40 + i * 104
-            r = self.cv.create_rectangle(BX1 - 2, y, BX1 + 56, y + 92, fill=col, outline=GOLD, width=2,
-                                         tags=("tab", f"tab_{key}"))
-            t = self.cv.create_text(BX1 + 27, y + 46, text=label, fill=TEXT_ON_DARK, angle=270,
-                                    font=(SERIF, 13, "bold"), tags=("tab", f"tab_{key}"))
-            self.tab_ids[key] = (r, t, y, col)
+            for st in ("normal", "hover", "active"):
+                self.tab_imgs[(key, st)] = ImageTk.PhotoImage(tab_pil(label, col, st))
+            self.tab_ids[key] = self.cv.create_image(BX1 - 2, y, image=self.tab_imgs[(key, "normal")], anchor="nw",
+                                                     tags=("tab", f"tab_{key}"))
             self.cv.tag_bind(f"tab_{key}", "<Button-1>", lambda _e, k=key: self.show(k))
-            self.cv.tag_bind(f"tab_{key}", "<Enter>", lambda _e: self.cv.config(cursor="hand2"))
-            self.cv.tag_bind(f"tab_{key}", "<Leave>", lambda _e: self.cv.config(cursor=""))
+            self.cv.tag_bind(f"tab_{key}", "<Enter>", lambda _e, k=key: self._tab_hover(k, True))
+            self.cv.tag_bind(f"tab_{key}", "<Leave>", lambda _e, k=key: self._tab_hover(k, False))
+
+    def _tab_hover(self, key, on):
+        self.cv.config(cursor="hand2" if on else "")
+        if key != self.page:
+            self.cv.itemconfig(self.tab_ids[key], image=self.tab_imgs[(key, "hover" if on else "normal")])
 
     def _mark_tab(self, active):
-        for key, (r, _t, y, col) in self.tab_ids.items():
-            on = key == active
-            self.cv.coords(r, BX1 - 2, y, BX1 + (66 if on else 56), y + 92)
-            self.cv.itemconfig(r, outline="#fff2b0" if on else GOLD, width=3 if on else 2)
+        for key, item in self.tab_ids.items():
+            self.cv.itemconfig(item, image=self.tab_imgs[(key, "active" if key == active else "normal")])
 
     def clear(self):
         for w in self.widgets:
