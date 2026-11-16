@@ -13,6 +13,7 @@ QUIET_S = 0.35
 MIN_S, MAX_S = 0.3, 4.0
 ACCEPT_DIST = 0.9        # default: larger DTW distance than this = "no match"
 MAX_RAW_PER_SPELL = 20
+UNLOCK_AT = 3            # recorded casts needed before a spell counts as "unlocked"
 
 
 class Segmenter:
@@ -114,6 +115,21 @@ class GestureStore:
             json.dump(self.data, f)
         with open(self.raw_path, "w", encoding="utf-8") as f:
             json.dump(self.raw, f)
+
+    # ---- progress ----
+    def casts(self, name: str) -> int:
+        return len(self.data.get(name, []))
+
+    def state(self, name: str) -> str:
+        """'locked' (no casts), 'learning' (1 to UNLOCK_AT-1 casts) or 'unlocked' (UNLOCK_AT or more).
+
+        Recognition works for learning spells too; more casts just make it more reliable.
+        """
+        n = self.casts(name)
+        return "unlocked" if n >= UNLOCK_AT else "learning" if n >= 1 else "locked"
+
+    def unlocked(self) -> List[str]:
+        return sorted(n for n in self.data if self.state(n) == "unlocked")
 
     # ---- recording ----
     def check(self, name: str, seq: List[List[float]]) -> Tuple[bool, str, Optional[float]]:

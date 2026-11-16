@@ -1,5 +1,6 @@
 """Magic Caster Companion: a spell-book desktop app for the Magic Caster Wand and Box."""
 import asyncio
+import collections
 import math
 import os
 import queue
@@ -8,16 +9,18 @@ import threading
 import time
 import tkinter as tk
 from tkinter import colorchooser, filedialog, messagebox, ttk
+from tkinter import font as tkfont
 
 from PIL import Image, ImageTk
 
 import gestures
 from actions import ACTION_TYPES, HINTS, play_cue, run_action, validate
+from gestures import UNLOCK_AT
 from mcwand import Box, LED_GROUPS, Wand, scan
 from settings import DATA_DIR, Settings
 from spells_data import (CAST_STEPS, DESCRIPTIONS, SPELLS, diagram_paths, pretty, resource_path,
                          spell_color, spell_effect)
-from ui_kit import (CARD, CARD_EDGE, FIELD, GOLD, INK, LEATHER, PARCH, PARCH_DARK, RED, SERIF, TEXT_ON_DARK,
+from ui_kit import (CARD, CARD_EDGE, FIELD, GOLD, INK, LEATHER, PARCH, PARCH_DARK, RED, SERIF,
                     RoundButton, Tip, apply_styles, battery_color, battery_percent, ink_image, make_leather,
                     make_page, state_color, style_titlebar, tab_pil)
 from version import __version__
@@ -27,11 +30,14 @@ BX0, BX1, BY0, BY1 = 30, 930, 25, 675
 SPINE = (BX0 + BX1) // 2
 LX, RX = BX0 + 28, SPINE + 28          # left/right page content origins
 PAGE_W = SPINE - BX0 - 56              # usable content width of a page
+SX0, SX1 = BX0 + 36, BX1 - 36          # content edges of a full two-page spread
 RETRY_S = 6                            # seconds between automatic reconnect attempts
+MUTED = "#7a6a4a"
 
-TABS = [("devices", "Devices", "#8a2323"), ("spells", "Spells", "#2f6b3a"),
-        ("cast", "Cast", "#243f73"), ("lights", "Lights", "#b8862b"),
-        ("notes", "Notes", "#5a2f6b")]
+TABS = [("devices", "Devices", "#8a2323"), ("spells", "Spells", "#2f6b3a"), ("teach", "Teach", "#1f6b72"),
+        ("cast", "Cast", "#243f73"), ("lights", "Lights", "#b8862b"), ("notes", "Notes", "#5a2f6b")]
+MARK = {"unlocked": "✦ ", "learning": "◇ ", "locked": "   "}
+STATE_TEXT = {"unlocked": "✦ Unlocked", "learning": "◇ Learning", "locked": "Locked"}
 
 
 def hexcolor(rgb):
@@ -64,9 +70,14 @@ class App(tk.Tk):
         self.color = (255, 200, 80)
         self.sel_spell = "lumos" if "lumos" in SPELLS else SPELLS[0]
         self.spin = 0.0
+        self.spin_hist = collections.deque(maxlen=400)      # (time, spin) for the live motion trace
+        self.last_cast: dict | None = None                  # most recent free cast, for the Cast page
+        self.cast_log: list = []                            # [(clock, spell or None, distance)]
         self.meter = None
+        self.scope = None
         self.status_item = None
-        self.scores_item = None
+        self.note_item = None
+        self.pip_item = None
         self.empty_item = None
         self.dev_dots: dict = {}
         self.batt_bars: dict = {}
@@ -83,17 +94,21 @@ class App(tk.Tk):
                      ("w_state", "w_info", "w_batt", "b_state", "b_info", "b_batt", "b_lid", "b_wand", "b_usb")}
         self.vars["w_state"].set("not connected")
         self.vars["b_state"].set("not connected")
-        self.g_status = tk.StringVar(value="Connect your wand, then record or cast.")
-        self.g_status.trace_add("write", self._status_changed)
+        self.t_status = tk.StringVar(value="Pick a spell, then press Record 3 casts.")
+        self.t_status.trace_add("write", lambda *_: self._set_item("status_item", self.t_status.get(), "teach"))
+        self.c_note = tk.StringVar(value="")
+        self.c_note.trace_add("write", lambda *_: self._set_item("note_item", self.c_note.get(), "cast"))
         self.cast_mode = tk.BooleanVar(value=True)
         self.test_mode = tk.BooleanVar(value=self.settings.get("test_mode"))
         self.accept_var = tk.DoubleVar(value=self.settings.get("accept"))
         self.pref_vars = {k: tk.BooleanVar(value=self.settings.get(k))
                           for k in ("sounds", "auto_reconnect", "base_status_light")}
+        self.chip_font = None
         apply_styles(self)
 
         self.cv = tk.Canvas(self, width=W, height=H, highlightthickness=0, bg=LEATHER)
         self.cv.pack()
+        self.chip_font = tkfont.Font(family=SERIF, size=10)
         self.leather = ImageTk.PhotoImage(make_leather(W, H, (BX0, BY0, BX1, BY1)))
         self.cv.create_image(0, 0, image=self.leather, anchor="nw")
         self.cv.create_rectangle(BX0 - 10, BY0 - 10, BX1 + 10, BY1 + 10, outline=GOLD, width=3)
@@ -101,6 +116,7 @@ class App(tk.Tk):
         ph = BY1 - BY0
         self.left_img = ImageTk.PhotoImage(make_page(SPINE - BX0, ph, True))
         self.right_img = ImageTk.PhotoImage(make_page(BX1 - SPINE, ph, False))
+        self.spread_img = ImageTk.PhotoImage(make_page(BX1 - BX0, ph, None))
         self.cv.create_image(BX0, BY0, image=self.left_img, anchor="nw")
         self.cv.create_image(SPINE, BY0, image=self.right_img, anchor="nw")
         self.cv.create_line(SPINE, BY0, SPINE, BY1, fill="#5a3c1c", width=2)
@@ -155,14 +171,37 @@ class App(tk.Tk):
                                             self.meter.winfo_height(), fill=RED, width=0, tags="bar")
             except tk.TclError:
                 self.meter = None
+        if self.scope is not None:
+            try:
+                self._draw_scope()
+            except tk.TclError:
+                self.scope = None
         self.after(90, self._tick)
 
-    def _status_changed(self, *_):
-        if self.status_item is not None and self.page == "cast":
+    def _draw_scope(self):
+        """Live trace of how fast the wand is turning over the last few seconds."""
+        c = self.scope
+        c.delete("all")
+        w, h = int(c["width"]), int(c["height"])
+        top, base = 8, h - 8
+        y_of = lambda v: base - min(v, 12.0) / 12.0 * (base - top)
+        c.create_line(0, y_of(gestures.START_SPIN), w, y_of(gestures.START_SPIN), fill=GOLD, dash=(4, 3))
+        now, win, pts = time.monotonic(), 3.5, []
+        for t, v in list(self.spin_hist):
+            if now - t <= win:
+                pts += [(1 - (now - t) / win) * w, y_of(v)]
+        if len(pts) >= 4:
+            c.create_line(*pts, fill=RED, width=2, smooth=True)
+        else:
+            c.create_text(w / 2, h / 2, text="waiting for the wand", fill=MUTED, font=(SERIF, 11, "italic"))
+
+    def _set_item(self, attr, text, page):
+        item = getattr(self, attr)
+        if item is not None and self.page == page:
             try:
-                self.cv.itemconfig(self.status_item, text=self.g_status.get())
+                self.cv.itemconfig(item, text=text)
             except tk.TclError:
-                self.status_item = None
+                setattr(self, attr, None)
 
     def _draw_footer(self):
         y = H - 24
@@ -219,9 +258,9 @@ class App(tk.Tk):
     def _draw_tabs(self):
         self.tab_ids, self.tab_imgs = {}, {}
         for i, (key, label, col) in enumerate(TABS):
-            y = BY0 + 40 + i * 104
+            y = BY0 + 28 + i * 100
             for st in ("normal", "hover", "active"):
-                self.tab_imgs[(key, st)] = ImageTk.PhotoImage(tab_pil(label, col, st))
+                self.tab_imgs[(key, st)] = ImageTk.PhotoImage(tab_pil(label, col, st, h=88))
             self.tab_ids[key] = self.cv.create_image(BX1 - 2, y, image=self.tab_imgs[(key, "normal")], anchor="nw",
                                                      tags=("tab", f"tab_{key}"))
             self.cv.tag_bind(f"tab_{key}", "<Button-1>", lambda _e, k=key: self.show(k))
@@ -245,11 +284,8 @@ class App(tk.Tk):
                 pass
         self.widgets = []
         self.cv.delete("page")
-        self.meter = None
-        self.logbox = None
-        self.status_item = None
-        self.scores_item = None
-        self.empty_item = None
+        self.meter = self.scope = None
+        self.logbox = self.status_item = self.note_item = self.pip_item = self.empty_item = None
         self.dev_dots, self.batt_bars = {}, {}
 
     def show(self, page, animate=True):
@@ -280,6 +316,7 @@ class App(tk.Tk):
     def _build(self, page):
         self.cv.delete("flip")
         getattr(self, f"_page_{page}")()
+        self.cv.tag_raise("tab")
         self._refresh_status()
 
     # ---------- widget helpers ----------
@@ -335,10 +372,10 @@ class App(tk.Tk):
         self.cv.create_line(mid + 18, y, x + w, y, fill="#9a7b45", width=1, tags="page")
         self.cv.create_text(mid, y, text="✦", fill="#9a7b45", font=(SERIF, 12), tags="page")
 
-    def card(self, x0, y0, x1, y1, r=14):
+    def card(self, x0, y0, x1, y1, r=14, fill=CARD, outline=CARD_EDGE, tags="page"):
         pts = [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1, x1 - r, y1, x0 + r, y1, x0, y1,
                x0, y1 - r, x0, y0 + r, x0, y0]
-        return self.cv.create_polygon(pts, smooth=True, fill=CARD, outline=CARD_EDGE, width=1.5, tags="page")
+        return self.cv.create_polygon(pts, smooth=True, fill=fill, outline=outline, width=1.5, tags=tags)
 
     # ---------- page: devices ----------
     def _device_card(self, key, x, y, w, h, title, subtitle, rows, on_connect, on_disconnect):
@@ -380,11 +417,11 @@ class App(tk.Tk):
         self.button("Connect wand & base", self.connect_all, LX, BY0 + 382,
                     tip="Scan, then connect both devices. They reconnect automatically if the link drops.")
         self.button("Scan only", self.do_scan, LX + 226, BY0 + 382, tip="List nearby devices in the Notes page")
-        # quick start
         self.card(LX - 14, BY0 + 438, LX + PAGE_W - 6, BY0 + 628)
         self.text(LX + 4, BY0 + 450, "Getting started", 14, bold=True, color=RED)
         steps = ("1   Wave the wand to wake it.\n2   Press Connect wand & base.\n"
-                 "3   Open Spells to see how each spell is cast.\n4   Open Cast and teach the book your motion.")
+                 "3   Open Spells to see how each spell is cast.\n"
+                 "4   Open Teach to unlock spells, then Cast to use them.")
         self.text(LX + 4, BY0 + 480, steps, 11, width=PAGE_W - 20)
 
         self._device_card("b", RX, BY0 + 20, PAGE_W - 20, 372, "The Base", "Magic Caster Box",
@@ -402,13 +439,14 @@ class App(tk.Tk):
         self.text(RX + (PAGE_W - 20) // 2, BY0 + 548, "An unofficial, community-made companion", 10, italic=True,
                   anchor="n", width=300)
         self.text(RX + (PAGE_W - 20) // 2, BY0 + 568, f"Version {__version__}", 10, italic=True, anchor="n",
-                  color="#7a6a4a")
+                  color=MUTED)
 
     # ---------- page: spells ----------
     def _page_spells(self):
         self.text(LX, BY0 + 20, "Index of Spells", 24, bold=True, italic=True, color=RED)
-        self.text(LX, BY0 + 62, "Choose a spell to see how it is cast. ✦ marks spells you have taught.", 10,
-                  italic=True)
+        n_un = len(self.store.unlocked())
+        self.text(LX, BY0 + 60, f"✦ unlocked   ◇ learning   no mark = locked      "
+                  f"{n_un} of {len(SPELLS)} unlocked", 10, italic=True)
         self.spell_filter = tk.StringVar()
         ent = tk.Entry(self, textvariable=self.spell_filter, bg=FIELD, fg=INK, relief="flat",
                        font=(SERIF, 12), highlightthickness=1, highlightbackground=PARCH_DARK,
@@ -428,8 +466,8 @@ class App(tk.Tk):
         self.spell_list.bind("<<ListboxSelect>>", self._spell_selected)
         self._fill_spells()
         self.button("Play effect", self.play_selected, RX, BY0 + 530, tip="Show this spell's light and buzz on the wand")
-        self.button("Teach this spell", lambda: self.show("cast"), RX + 124, BY0 + 530,
-                    tip="Go to the Cast page to record your own casts of this spell")
+        self.button("Teach this spell", lambda: self.show("teach"), RX + 124, BY0 + 530,
+                    tip="Go to the Teach page to unlock this spell")
         self.button("Actions & colour...", self._action_dialog, RX, BY0 + 578,
                     tip="Choose this spell's light colour and what it does on your PC")
         self._draw_spell_detail()
@@ -439,8 +477,7 @@ class App(tk.Tk):
         self.spell_view = [s for s in SPELLS if q in s]
         self.spell_list.delete(0, "end")
         for s in self.spell_view:
-            mark = "✦ " if s in self.store.data else "   "
-            self.spell_list.insert("end", mark + pretty(s))
+            self.spell_list.insert("end", MARK[self.store.state(s)] + pretty(s))
             if s == self.sel_spell:
                 self.spell_list.selection_set("end")
                 self.spell_list.see("end")
@@ -470,99 +507,221 @@ class App(tk.Tk):
                 self.text(x, BY0 + 150 + self._detail_imgs[0].height() + 4, "Two ways to cast it", 9,
                           italic=True, tags=tg)
         else:
-            self.text(x, BY0 + 160, "No diagram is available for this spell yet.\nRecord your own motion on the "
-                      "Cast page.", 10, italic=True, tags=tg)
+            self.text(x, BY0 + 160, "No diagram is available for this spell yet.\nInvent your own motion on the "
+                      "Teach page.", 10, italic=True, tags=tg)
         one = bool(paths) and len(paths) == 1
         tx, ty, tw = (x + 210, BY0 + 150, PAGE_W - 210) if one else (x, BY0 + 340, PAGE_W)
         self.text(tx, ty, "How to cast", 13, bold=True, tags=tg, width=tw)
         self.text(tx, ty + 26, CAST_STEPS, 10, tags=tg, width=tw)
-        n = len(self.store.data.get(s, []))
+        st, n = self.store.state(s), self.store.casts(s)
+        meaning = {"unlocked": "The book will recognise this spell when you cast it.",
+                   "learning": f"Recognised, but needs {UNLOCK_AT - n} more cast(s) to unlock fully.",
+                   "locked": "The book can't recognise it yet. Teach it on the Teach page."}[st]
+        info = f"{STATE_TEXT[st]}  ({n} recorded casts)\n{meaning}"
         act = self.settings.action(s)
-        info = f"Your recorded casts: {n}"
-        info += f"\nOn cast: {act['type']} {act['value']}" if act else ""
-        self.text(x, BY0 + 475, info, 10, italic=True, tags=tg)
+        if act:
+            info += f"\nOn cast: {act['type']} {act['value']}"
+        self.text(x, BY0 + 462, info, 10, italic=True, tags=tg)
 
-    # ---------- page: cast ----------
-    def _page_cast(self):
-        self.text(LX, BY0 + 20, "Teach & Cast", 24, bold=True, italic=True, color=RED)
-        self.text(LX, BY0 + 62, "Teach the book your own motion for a spell: record three casts, then cast it.",
-                  10, italic=True)
-        self.text(LX, BY0 + 100, "Spell to teach", 12, bold=True)
+    # ---------- page: teach ----------
+    def _page_teach(self):
+        self.text(LX, BY0 + 20, "Teach a Spell", 24, bold=True, italic=True, color=RED)
+        self.card(LX - 14, BY0 + 62, LX + PAGE_W - 6, BY0 + 160)
+        self.text(LX + 4, BY0 + 70, "The wand only reports its motion, so the book learns how you cast each "
+                  "spell. Spells start locked. Cast one three times and it unlocks: from then on the book "
+                  "recognises it.", 10, italic=True, width=PAGE_W - 24)
+        self.text(LX, BY0 + 176, "1  Choose a spell", 12, bold=True)
         self.cast_combo = ttk.Combobox(self, style="Book.TCombobox", values=[pretty(s) for s in SPELLS],
                                        state="readonly", width=30, font=(SERIF, 11))
         self.cast_combo.set(pretty(self.sel_spell))
-        self.cast_combo.bind("<<ComboboxSelected>>", self._cast_pick)
-        self.put(self.cast_combo, LX, BY0 + 126)
-        self.button("Record 3 casts", lambda: self.arm_record(3), LX, BY0 + 164,
+        self.cast_combo.bind("<<ComboboxSelected>>", self._teach_pick)
+        self.put(self.cast_combo, LX, BY0 + 202)
+        self.text(LX, BY0 + 244, "2  Cast it three times", 12, bold=True)
+        self.button("Record 3 casts", lambda: self.arm_record(3), LX, BY0 + 270,
                     tip="Cast the spell three times. The book learns your motion and rejects stray ones.")
-        self.button("Record 1 cast", lambda: self.arm_record(1), LX + 148, BY0 + 164,
+        self.button("Record 1 cast", lambda: self.arm_record(1), LX + 148, BY0 + 270,
                     tip="Add a single cast to this spell")
-        self.check("Recognise my casts and play the effect", self.cast_mode, LX, BY0 + 212)
-        self.check("Test mode (recognise only, run no actions)", self.test_mode, LX, BY0 + 238,
-                   lambda: self.settings.set("test_mode", bool(self.test_mode.get())))
-        self.slider(LX, BY0 + 270, "Sensitivity limit (lower is stricter)", float(self.accept_var.get()), 0.3, 2.0,
-                    0.05, 190, lambda v: f"{v:.2f}", on_change=lambda v: self.accept_var.set(round(v, 2)),
-                    on_release=lambda: self.settings.set("accept", round(float(self.accept_var.get()), 2)))
-        self.button("Auto-tune", self.autotune, LX + 286, BY0 + 280,
-                    tip="Set the limit from a self-test of your own recorded casts")
-        self.ornament(LX, BY0 + 338)
-        self.text(LX, BY0 + 350, "Spells you have taught", 13, bold=True)
+        self.pip_item = self.text(LX, BY0 + 316, "", 14, bold=True, color=RED)
+        self.status_item = self.text(LX, BY0 + 342, self.t_status.get(), 11, italic=True, width=PAGE_W)
+        self.ornament(LX, BY0 + 410)
+        self.text(LX, BY0 + 420, "Spells you are teaching", 13, bold=True)
         self.g_list = tk.Listbox(self, bg=PARCH, fg=INK, font=(SERIF, 12), bd=0, highlightthickness=0,
                                  selectbackground="#c9a96a", selectforeground=INK, activestyle="none",
-                                 height=6, width=33, exportselection=False)
-        self.put(self.g_list, LX, BY0 + 380)
+                                 height=5, width=33, exportselection=False)
+        self.put(self.g_list, LX, BY0 + 450)
         self.g_win = self.last_win
-        self.empty_item = self.text(LX + 4, BY0 + 392, "None yet. Pick a spell above and press\nRecord 3 casts.",
-                                    11, italic=True, color="#7a6a4a", width=PAGE_W - 10)
+        self.empty_item = self.text(LX + 4, BY0 + 456, "Nothing yet. Choose a spell above and\npress Record 3 casts.",
+                                    11, italic=True, color=MUTED, width=PAGE_W - 10)
         self._fill_gestures()
-        self.button("Forget", self.delete_gesture, LX, BY0 + 566, tip="Forget the selected spell's casts")
-        self.button("Export", self.export_gestures, LX + 92, BY0 + 566, tip="Save your casts to a file to share")
-        self.button("Import", self.import_gestures, LX + 184, BY0 + 566, tip="Add casts from a shared file")
-        self.button("Check", self.check_casts, LX + 276, BY0 + 566,
+        self.button("Forget", self.delete_gesture, LX, BY0 + 572, tip="Forget the selected spell's casts")
+        self.button("Export", self.export_gestures, LX + 92, BY0 + 572, tip="Save your casts to a file to share")
+        self.button("Import", self.import_gestures, LX + 184, BY0 + 572, tip="Add casts from a shared file")
+        self.button("Check", self.check_casts, LX + 276, BY0 + 572,
                     tip="Self-test: how reliably are your recorded casts told apart?")
 
-        self.text(RX, BY0 + 24, "The Last Cast", 20, bold=True)
-        self.status_item = self.text(RX, BY0 + 64, self.g_status.get(), 15, bold=True, italic=True, color=RED,
-                                     width=PAGE_W - 20)
-        self.text(RX, BY0 + 150, "Motion", 10, italic=True)
+        self.text(RX, BY0 + 24, "Trace this", 20, bold=True)
+        self.text(RX, BY0 + 58, "Start at the dot and follow the arrows.", 10, italic=True)
+        self.text(RX, BY0 + 88, "Motion", 10, italic=True)
         self.meter = tk.Canvas(self, width=PAGE_W - 60, height=14, bg=FIELD, highlightthickness=1,
                                highlightbackground=PARCH_DARK)
-        self.put(self.meter, RX + 60, BY0 + 150)
-        self.scores_item = self.text(RX + 215, BY0 + 222, "Cast to see how close each of your spells is.", 11,
-                                     italic=True, width=170)
-        self.cast_imgs = []
-        self._cast_diagram()
+        self.put(self.meter, RX + 60, BY0 + 88)
+        self._teach_diagram()
+        self.card(RX - 14, BY0 + 520, RX + PAGE_W + 6, BY0 + 640)
+        self.text(RX + 4, BY0 + 528, "What the marks mean", 12, bold=True, color=RED)
+        self.text(RX + 4, BY0 + 552, f"Locked: not taught yet, so the book can't tell when you cast it.\n"
+                  f"◇ Learning: 1 or 2 casts recorded. It is recognised, but not reliably.\n"
+                  f"✦ Unlocked: {UNLOCK_AT} or more casts. More casts make it more reliable.", 10,
+                  width=PAGE_W - 20)
+        self._update_pips()
 
-    def _cast_pick(self, _e):
+    def _teach_pick(self, _e):
         name = self.cast_combo.get().lower().replace(" ", "_")
         if name in SPELLS:
             self.sel_spell = name
             self.cv.delete("cdiag")
-            self._cast_diagram()
+            self._teach_diagram()
+            self._update_pips()
 
-    def _cast_diagram(self):
+    def _teach_diagram(self):
         paths = diagram_paths(self.sel_spell)
-        self.text(RX, BY0 + 190, f"Trace: {pretty(self.sel_spell)}", 13, bold=True, tags=("page", "cdiag"),
-                  width=PAGE_W)
+        self.text(RX, BY0 + 122, pretty(self.sel_spell), 15, bold=True, italic=True, color=RED,
+                  tags=("page", "cdiag"))
         if paths:
             iw = 200 if len(paths) == 1 else 130
             self.cast_imgs = [ink_image(p, iw) for p in paths]
             for i, im in enumerate(self.cast_imgs):
-                self.cv.create_image(RX + i * (iw + 10), BY0 + 222, image=im, anchor="nw", tags=("page", "cdiag"))
+                self.cv.create_image(RX + i * (iw + 10), BY0 + 150, image=im, anchor="nw", tags=("page", "cdiag"))
         else:
-            self.text(RX, BY0 + 230, "No diagram for this spell; invent your own motion.", 10, italic=True,
+            self.text(RX, BY0 + 160, "No diagram for this spell; invent your own motion.", 10, italic=True,
                       tags=("page", "cdiag"))
+
+    def _update_pips(self):
+        if self.pip_item is None:
+            return
+        n = self.store.casts(self.sel_spell)
+        filled = min(UNLOCK_AT, n)
+        pips = "●" * filled + "○" * (UNLOCK_AT - filled)
+        try:
+            self.cv.itemconfig(self.pip_item, text=f"{pips}   {STATE_TEXT[self.store.state(self.sel_spell)]}"
+                                                    f"  ({n} casts)")
+        except tk.TclError:
+            self.pip_item = None
 
     def _fill_gestures(self):
         self.g_list.delete(0, "end")
         for n, s in sorted(self.store.data.items()):
-            self.g_list.insert("end", f"{pretty(n)}  ({len(s)} casts)")
+            self.g_list.insert("end", f"{MARK[self.store.state(n)]}{pretty(n)}  ({len(s)} casts)")
         try:  # the list is hidden while empty so the hint text underneath shows
             self.cv.itemconfig(self.g_win, state="normal" if self.store.data else "hidden")
             if self.empty_item is not None:
                 self.cv.itemconfig(self.empty_item, state="hidden" if self.store.data else "normal")
         except (tk.TclError, AttributeError):
             pass
+        self._update_pips()
+
+    # ---------- page: cast (free casting, a full two-page spread) ----------
+    def _page_cast(self):
+        self.cv.create_image(BX0, BY0, image=self.spread_img, anchor="nw", tags="page")
+        self.text(SX0, BY0 + 14, "Free Casting", 26, bold=True, italic=True, color=RED)
+        self.text(SX0, BY0 + 60, "Cast any spell you like. The book recognises the ones you have unlocked.", 11,
+                  italic=True, width=560)
+        unlocked = self.store.unlocked()
+        self.text(SX1, BY0 + 24, f"✦ {len(unlocked)} of {len(SPELLS)} spells unlocked", 14, bold=True,
+                  anchor="ne", width=320)
+
+        self.text(SX0, BY0 + 96, "Motion", 12, bold=True)
+        self.scope = tk.Canvas(self, width=250, height=120, bg=FIELD, highlightthickness=1,
+                               highlightbackground=PARCH_DARK)
+        self.put(self.scope, SX0, BY0 + 122)
+        self.text(SX0, BY0 + 252, "How fast the wand is turning, over the last few seconds. A cast starts when "
+                  "the line rises above the gold mark.", 10, italic=True, width=250)
+        self.card(SX0 + 280, BY0 + 90, SX1, BY0 + 330)
+        self._draw_cast_live()
+        self.ornament(SX0, BY0 + 352, SX1 - SX0)
+
+        self.text(SX0, BY0 + 368, "Recent casts", 14, bold=True)
+        self._draw_history()
+        x2 = SX0 + 440
+        self.text(x2, BY0 + 368, "Your unlocked spells", 14, bold=True)
+        self._draw_chips(x2, BY0 + 398, SX1 - x2)
+        self.check("Recognise casts (works on every page)", self.cast_mode, x2, BY0 + 512)
+        self.check("Test mode: recognise only, run no actions", self.test_mode, x2, BY0 + 538,
+                   lambda: self.settings.set("test_mode", bool(self.test_mode.get())))
+        self.slider(x2, BY0 + 568, "Sensitivity limit (lower is stricter)", float(self.accept_var.get()), 0.3, 2.0,
+                    0.05, 170, lambda v: f"{v:.2f}", on_change=lambda v: self.accept_var.set(round(v, 2)),
+                    on_release=lambda: self.settings.set("accept", round(float(self.accept_var.get()), 2)))
+        self.button("Auto-tune", self.autotune, x2 + 262, BY0 + 576,
+                    tip="Set the limit from a self-test of your own recorded casts")
+        self.note_item = self.text(x2, BY0 + 622, self.c_note.get(), 10, italic=True, color=MUTED, width=SX1 - x2)
+
+    def _draw_cast_live(self):
+        """The big result card: the latest recognised (or missed) cast."""
+        self.cv.delete("live")
+        x0, y0, x1, y1 = SX0 + 280, BY0 + 90, SX1, BY0 + 330
+        tg = ("page", "live")
+        lc = self.last_cast
+        mid = (x0 + x1) // 2
+        if lc is None:
+            self.text(mid, y0 + 78, "Cast a spell", 30, italic=True, color=MUTED, anchor="n", tags=tg)
+            msg = ("Wave the wand to cast. Any spell you have unlocked is recognised here, and you can cast "
+                   "with this page closed too." if self.store.unlocked() else
+                   "You have not unlocked any spells yet. Open Teach to unlock your first.")
+            self.text(mid, y0 + 130, msg, 11, italic=True, color=MUTED, anchor="n", width=440, tags=tg)
+            return
+        near = ", ".join(f"{pretty(n)} {d:.2f}" for n, d in lc["near"][:3])
+        if lc["name"]:
+            n = lc["name"]
+            self.text(x0 + 24, y0 + 22, pretty(n), 32, bold=True, italic=True, color=RED, width=330, tags=tg)
+            self.text(x0 + 24, y0 + 108, DESCRIPTIONS.get(n, ""), 12, italic=True, width=330, tags=tg)
+            self.text(x0 + 24, y0 + 168, f"distance {lc['dist']:.2f}   ·   limit {lc['limit']:.2f}", 10,
+                      color=MUTED, width=330, tags=tg)
+            self.text(x0 + 24, y0 + 190, f"Closest: {near}", 10, color=MUTED, width=330, tags=tg)
+            paths = diagram_paths(n)
+            if paths:
+                self._live_img = ink_image(paths[0], 118)
+                self.cv.create_image(x1 - 24, y0 + 18, image=self._live_img, anchor="ne", tags=tg)
+        else:
+            self.text(mid, y0 + 40, "Nothing recognised", 26, italic=True, color="#7a4a2a", anchor="n", tags=tg)
+            self.text(mid, y0 + 100, f"Closest: {near}\nLimit {lc['limit']:.2f}. Try again, teach more casts, or "
+                      "raise the limit below.", 11, italic=True, color=MUTED, anchor="n", width=440, tags=tg)
+
+    def _draw_history(self):
+        self.cv.delete("hist")
+        tg = ("page", "hist")
+        if not self.cast_log:
+            self.text(SX0, BY0 + 400, "Your casts will be listed here.", 11, italic=True, color=MUTED, tags=tg,
+                      width=380)
+            return
+        for i, (clock, name, dist) in enumerate(reversed(self.cast_log[-8:])):
+            y = BY0 + 400 + i * 24
+            if name:
+                self.text(SX0, y, f"{clock}   ✦ {pretty(name)}", 12, bold=(i == 0), tags=tg, width=300)
+            else:
+                self.text(SX0, y, f"{clock}   not recognised", 12, italic=True, color=MUTED, tags=tg, width=300)
+            self.text(SX0 + 380, y + 2, f"{dist:.2f}", 10, color=MUTED, anchor="ne", tags=tg, width=60)
+
+    def _draw_chips(self, x, y, w):
+        names = self.store.unlocked()
+        if not names:
+            self.text(x, y, "None yet. Open the Teach page and cast a spell three times to unlock it.", 11,
+                      italic=True, color=MUTED, width=w)
+            self.button("Go to Teach", lambda: self.show("teach"), x, y + 56)
+            return
+        h, gap, cx, cy, shown = 26, 8, x, y, 0
+        for n in names:
+            label = "✦ " + pretty(n)
+            tw = self.chip_font.measure(label) + 22
+            if cx + tw > x + w:
+                cx, cy = x, cy + h + gap
+            if cy > y + 2 * (h + gap):
+                break
+            self.card(cx, cy, cx + tw, cy + h, r=13)
+            self.text(cx + tw // 2, cy + h // 2, label, 10, anchor="center", width=tw)
+            cx += tw + gap
+            shown += 1
+        if shown < len(names):
+            self.text(x + w, y + 3 * (h + gap) - 4, f"+{len(names) - shown} more", 10, italic=True, color=MUTED,
+                      anchor="ne", width=120)
 
     # ---------- page: lights ----------
     def _page_lights(self):
@@ -623,7 +782,7 @@ class App(tk.Tk):
                   "The protocol was learned by probing real devices and from the MIT-licensed "
                   "hass-magic-caster-wand project by eigger, whose spell diagrams are also used here.\n\n"
                   "Your recorded casts, colours and actions are kept in your user profile.\n\n"
-                  "Shortcuts: Ctrl+1 to Ctrl+5 turn to each page.", 11)
+                  "Shortcuts: Ctrl+1 to Ctrl+6 turn to each page.", 11)
         self.button("Open data folder", lambda: os.startfile(DATA_DIR) if os.path.isdir(DATA_DIR) else None,
                     RX, BY0 + 500, tip="Where your casts, colours and settings are stored")
 
@@ -890,13 +1049,14 @@ class App(tk.Tk):
     def arm_record(self, n):
         if not (self.wand and self.wand.connected):
             self.log("Connect the wand first.")
-            self.g_status.set("Connect your wand on the Devices page first.")
+            self.t_status.set("Connect your wand on the Devices page first.")
             return
         self.rec = {"name": self.sel_spell, "need": n, "got": 0}
-        self.g_status.set(f"{pretty(self.sel_spell)}: cast 1 of {n}. Make the motion now...")
+        self.t_status.set(f"{pretty(self.sel_spell)}: cast 1 of {n}. Make the motion now...")
 
     def _on_imu(self, samples):  # BLE thread
-        self.spin = math.sqrt(sum(g * g for g in samples[-1].gyro))
+        self.spin = max(math.sqrt(sum(g * g for g in s.gyro)) for s in samples)
+        self.spin_hist.append((time.monotonic(), self.spin))
         for smp in samples:
             g = self.seg.feed(smp)
             if g:
@@ -914,52 +1074,59 @@ class App(tk.Tk):
         if not ok and r.get("rejects", 0) < 2:
             r["rejects"] = r.get("rejects", 0) + 1
             self.cue("fail")
-            self.g_status.set(f"{msg} Try that cast again ({r['got'] + 1} of {r['need']}). "
+            self.t_status.set(f"{msg} Try that cast again ({r['got'] + 1} of {r['need']}). "
                               "(If it keeps happening, the next one is kept anyway.)")
             return
         r["rejects"] = 0
+        before = self.store.casts(r["name"])
         self.store.add(r["name"], g)
         r["got"] += 1
         self.cue("saved")
-        self.log(f"Recorded {pretty(r['name'])} cast {len(self.store.data[r['name']])} ({len(g)} samples)")
-        if self.page == "cast":
+        self.log(f"Recorded {pretty(r['name'])} cast {self.store.casts(r['name'])} ({len(g)} samples)")
+        just_unlocked = before < UNLOCK_AT <= self.store.casts(r["name"])
+        if self.page == "teach":
             self._fill_gestures()
         if r["got"] < r["need"]:
-            self.g_status.set(f"Saved {r['got']} of {r['need']}. Cast {pretty(r['name'])} again...")
+            self.t_status.set(f"Saved {r['got']} of {r['need']}. Cast {pretty(r['name'])} again...")
             return
         self.rec = None
-        total = len(self.store.data[r["name"]])
-        msg = f"All saved: {pretty(r['name'])} now has {total} casts."
-        if total < 3:
-            msg += " Record a few more for better results."
+        total = self.store.casts(r["name"])
+        msg = (f"{pretty(r['name'])} is unlocked! The book will now recognise it." if just_unlocked
+               else f"Saved. {pretty(r['name'])} now has {total} casts.")
+        if total < UNLOCK_AT:
+            msg += f" {UNLOCK_AT - total} more to unlock it."
         chk = self.store.self_check()
         if chk:
             msg += f" Self-test: {chk['correct']} of {chk['total']} casts recognised."
-        self.g_status.set(msg)
+        self.t_status.set(msg)
+        if just_unlocked:
+            self.log(f"Unlocked {pretty(r['name'])}")
+            self.cue("success")
+            self._flash(r["name"], self.settings.color(r["name"]) or spell_color(r["name"]),
+                        f"{pretty(r['name'])} unlocked!")
 
     def _cast(self, g):
         if not self.store.data:
-            self.g_status.set("The book knows no spells yet. Teach it one first.")
+            if self.page == "teach":
+                self.t_status.set("The book knows no spells yet. Teach it one first.")
             return
         accept = float(self.settings.get("accept"))
         best, dist, scores = self.store.match(g, accept)
-        top = sorted(scores.items(), key=lambda kv: kv[1])[:4]
-        if self.scores_item is not None:
-            lines = [f"{pretty(n)}  {d:.2f}" for n, d in top] + [f"limit {accept:.2f}"]
-            try:
-                self.cv.itemconfig(self.scores_item, text="Closest:\n" + "\n".join(lines))
-            except tk.TclError:
-                self.scores_item = None
+        near = sorted(scores.items(), key=lambda kv: kv[1])[:4]
+        self.last_cast = {"name": best, "dist": dist, "limit": accept, "near": near}
+        self.cast_log.append((time.strftime("%H:%M:%S"), best, dist))
+        self.cast_log = self.cast_log[-50:]
+        if self.page == "cast":
+            self._draw_cast_live()
+            self._draw_history()
         if not best:
             self.cue("fail")
-            self.g_status.set(f"Nothing recognised (closest {dist:.2f}, limit {accept:.2f}). Try again, or teach more "
-                              "casts.")
             return
-        self.g_status.set(f"{pretty(best)}!   (distance {dist:.2f})")
         self.log(f"Cast {pretty(best)} d={dist:.2f}")
         self.cue("success")
         col = self.settings.color(best) or spell_color(best)
-        self._flash(best, col)
+        if self.page != "cast":          # the Cast page shows the result itself
+            self._flash(best, col)
         self.wand_call("play", spell_effect(best, self.settings.color(best)))
         act = self.settings.action(best)
         if act:
@@ -971,10 +1138,11 @@ class App(tk.Tk):
                 except Exception as e:
                     self.log(f"Action failed: {e}")
 
-    def _flash(self, name, rgb):
-        """Spell name glows on the right-hand page, then fades into the parchment."""
+    def _flash(self, name, rgb, text=None):
+        """The spell name glows in the middle of the page, then fades into the parchment."""
         steps, pr = 16, (0xe8, 0xd9, 0xb5)
-        cx, cy = SPINE + (BX1 - SPINE) // 2, BY0 + 420
+        cx = SPINE if self.page == "cast" else SPINE + (BX1 - SPINE) // 2
+        cy = BY0 + 430
 
         def frame(i):
             self.cv.delete("flash")
@@ -982,20 +1150,20 @@ class App(tk.Tk):
                 return
             t = i / steps
             c = tuple(int(rgb[j] * 0.75 * (1 - t) + pr[j] * t) for j in range(3))
-            self.cv.create_text(cx, cy, text=pretty(name), fill=hexcolor(c), width=380,
-                                font=(SERIF, 30 + int(8 * (1 - t)), "bold italic"), tags="flash")
+            self.cv.create_text(cx, cy, text=text or pretty(name), fill=hexcolor(c), width=380,
+                                font=(SERIF, 28 + int(8 * (1 - t)), "bold italic"), tags="flash")
             self.after(50, lambda: frame(i + 1))
         frame(0)
 
     def autotune(self):
         chk = self.store.self_check()
         if not chk or chk["suggested_accept"] is None:
-            self.g_status.set("Record at least two casts of a spell first, then try again.")
+            self.c_note.set("Teach at least two casts of a spell first, then try again.")
             return
         s = chk["suggested_accept"]
         self.accept_var.set(s)
         self.settings.set("accept", s)
-        self.g_status.set(f"Self-test: {chk['correct']} of {chk['total']} recognised. Sensitivity limit set to {s}.")
+        self.c_note.set(f"Self-test: {chk['correct']} of {chk['total']} recognised. Limit set to {s}.")
         if self.page == "cast":  # redraw so the slider moves to the new value
             self.clear()
             self._build("cast")
@@ -1003,25 +1171,25 @@ class App(tk.Tk):
     def check_casts(self):
         chk = self.store.self_check()
         if not chk:
-            self.g_status.set("Record at least two casts of a spell first.")
+            self.t_status.set("Record at least two casts of a spell first.")
             return
         msg = f"Self-test: {chk['correct']} of {chk['total']} of your casts are recognised."
         if chk["confused"]:
             pairs = sorted({f"{pretty(a)} looks like {pretty(b)}" for a, b in chk["confused"]})
             msg += " Mixed up: " + "; ".join(pairs[:3]) + "."
-        self.g_status.set(msg)
+        self.t_status.set(msg)
 
     def delete_gesture(self):
         sel = self.g_list.curselection()
         if sel:
             name = sorted(self.store.data)[sel[0]]
-            if messagebox.askyesno("Forget spell", f"Forget all casts of {pretty(name)}?"):
+            if messagebox.askyesno("Forget spell", f"Forget all casts of {pretty(name)}? It will be locked again."):
                 self.store.remove(name)
                 self._fill_gestures()
 
     def export_gestures(self):
         if not self.store.data:
-            self.g_status.set("Nothing to export yet.")
+            self.t_status.set("Nothing to export yet.")
             return
         p = filedialog.asksaveasfilename(defaultextension=".json", initialfile="my-spells.json",
                                          filetypes=[("Spell files", "*.json")])
@@ -1039,7 +1207,7 @@ class App(tk.Tk):
             messagebox.showerror("Import", f"Could not import that file: {e}")
             return
         self._fill_gestures()
-        self.g_status.set(f"Imported {n} casts.")
+        self.t_status.set(f"Imported {n} casts.")
 
     def _close(self):
         for d in (self.wand, self.box):
@@ -1071,6 +1239,23 @@ def _screenshots(app: App, outdir: str, demo: bool = True):
                      ("b_state", "connected"), ("b_info", "32.1"), ("b_batt", "100%"), ("b_lid", "removed"),
                      ("b_wand", "no"), ("b_usb", "unplugged")):
             app.vars[k].set(v)
+        blank = [[0.0] * 6 for _ in range(gestures.N_POINTS)]
+        for name, n in (("lumos", 4), ("nox", 3), ("expelliarmus", 3), ("protego", 5), ("accio", 3),
+                        ("stupefy", 3), ("incendio", 2), ("reparo", 1), ("aguamenti", 3), ("alohomora", 3),
+                        ("wingardium_leviosa", 3), ("expecto_patronum", 3)):
+            app.store.data[name] = [blank] * n
+        app.last_cast = {"name": "expelliarmus", "dist": 0.41, "limit": 0.9,
+                         "near": [("expelliarmus", 0.41), ("stupefy", 0.88), ("protego", 1.12)]}
+        app.cast_log = [("14:02:11", "lumos", 0.33), ("14:02:19", "nox", 0.52), ("14:02:40", None, 1.31),
+                        ("14:03:02", "protego", 0.47), ("14:03:20", "expelliarmus", 0.41)]
+        now = time.monotonic()
+        for i in range(60):   # a believable motion trace: rest, one swish, rest
+            t = i / 60 * 3.5
+            app.spin_hist.append((now - 3.5 + t, 0.4 + (7 * math.sin((t - 1.2) / 1.0 * math.pi)
+                                                         if 1.2 < t < 2.2 else 0.0)))
+        app.t_status.set("Protego: cast 2 of 3. Make the motion now...")
+        app.sel_spell = "protego"
+        app.accept_var.set(0.9)       # documentation shows the default, not whatever this PC has saved
 
     def grab(i=0):
         if i >= len(keys):
@@ -1082,18 +1267,16 @@ def _screenshots(app: App, outdir: str, demo: bool = True):
         app.page = keys[i]
         app._mark_tab(keys[i])
         app.clear()
-        app._build(keys[i])
         if keys[i] == "spells":
             app.sel_spell = "expelliarmus"
-            app._fill_spells()
-            app._draw_spell_detail()
-        if keys[i] == "cast":
-            app.sel_spell = "expelliarmus"
-            app._cast_pick(None)
-            app.cast_combo.set(pretty(app.sel_spell))
-            app.g_status.set("Expelliarmus!   (distance 0.41)")
-            app.cv.itemconfig(app.scores_item,
-                              text="Closest:\nExpelliarmus  0.41\nStupefy  0.88\nProtego  1.12\nlimit 0.90")
+        if keys[i] == "cast":          # fresh timestamps so the demo motion trace is inside the 3.5 s window
+            now = time.monotonic()
+            app.spin_hist.clear()
+            for j in range(60):
+                t = j / 60 * 3.5
+                app.spin_hist.append((now - 3.5 + t, 0.4 + (7 * math.sin((t - 1.2) / 1.0 * math.pi)
+                                                             if 1.2 < t < 2.2 else 0.0)))
+        app._build(keys[i])
         app.update()
         app.after(500, lambda: (snap(keys[i]), grab(i + 1)))
     app.after(900, grab)

@@ -129,3 +129,23 @@ def test_segmenter_ignores_tiny_jolt():
         out.append(seg.feed(ImuSample((spin, 0, 0), (0, 0, 1)), now=t))
         t += 0.02
     assert not any(out)
+
+
+def test_unlock_states(tmp_path):
+    random.seed(5)
+    st = G.GestureStore(str(tmp_path / "u.json"))
+    assert st.state("circle") == "locked" and st.casts("circle") == 0
+    st.add("circle", circle())
+    assert st.state("circle") == "learning"
+    st.add("circle", circle())
+    assert st.state("circle") == "learning" and st.unlocked() == []
+    st.add("circle", circle())
+    assert st.state("circle") == "unlocked" and st.unlocked() == ["circle"]
+    st.add("line", line())
+    assert st.unlocked() == ["circle"]               # one cast is only "learning"
+    st.remove("circle")
+    assert st.state("circle") == "locked" and st.unlocked() == []
+
+
+def test_unlock_threshold_constant():
+    assert G.UNLOCK_AT == 3

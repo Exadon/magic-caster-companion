@@ -13,7 +13,7 @@ from a Windows PC. No firmware is changed.
 
 ## What it does
 
-The app looks like a spell book, with a ribbon tab for each page (or press Ctrl+1 to Ctrl+5). A status line along
+The app looks like a spell book, with a ribbon tab for each page (or press Ctrl+1 to Ctrl+6). A status line along
 the bottom always shows, with a coloured dot, whether the wand and base are connected. Hover over any button for a
 hint. A soft page-turn sound plays as the pages turn (synthesised in code, so there is no audio file to ship);
 turn sounds off under **Lights > Preferences**.
@@ -21,25 +21,36 @@ turn sounds off under **Lights > Preferences**.
 | Page | What's on it |
 |---|---|
 | **Devices** | Connect the wand and base (one button, or each on its own). Model, firmware, battery, and the base's lid, wand-in-base and USB-power state. Connects and reconnects automatically |
-| **Spells** | Index of about 80 spells. Pick one to see its gesture diagram, a short description and how to cast it. Play its light and buzz effect, or set its colour and an **action** |
-| **Cast** | Teach the book your own motion for each spell, then cast. See how close each spell was, tune the sensitivity, and check your recorded casts |
+| **Spells** | Index of about 80 spells, each marked locked, learning or unlocked. Pick one to see its gesture diagram, a short description and how to cast it. Play its light and buzz effect, or set its colour and an **action** |
+| **Teach** | Unlock a spell: pick it, then cast it three times. Shows progress, lists the spells you are teaching, and can check, export and import your casts |
+| **Cast** | Free casting on a full two-page spread. Cast anything: the book names the spells you have unlocked, with a live motion trace, a history of recent casts, your unlocked spells, and the recognition settings |
 | **Lights** | Set each LED group on the wand and the base's light, make the wand buzz, and set preferences |
 | **Notes** | Activity log, version, and credits |
 
-### Casting spells
+### How spells unlock
 
-The wand sends raw motion data, so the book learns **your** version of each spell:
+The wand only sends raw motion data. It has no built-in spell recognition, so the book learns **your** version of
+each spell. That is what "teaching" means.
+
+| Mark | State | Meaning |
+|---|---|---|
+| (none) | **Locked** | You haven't recorded this spell. The book can't tell when you cast it |
+| ◇ | **Learning** | 1 or 2 casts recorded. Recognised, but not reliably |
+| ✦ | **Unlocked** | 3 or more casts recorded. More casts make it more reliable |
 
 1. On the **Spells** page, look at the diagram for a spell: start at the dot and trace the arrows.
-2. On the **Cast** page, pick the spell and press **Record 3 casts**. A cast that looks like a different
-   spell is rejected, so one stray motion can't spoil the set.
-3. Leave *Recognise my casts* ticked and cast. The spell name glows on the page, the wand lights up and buzzes,
-   and a sound plays.
-4. **Check** runs a self-test of your recorded casts and tells you which spells get mixed up. **Auto-tune** sets the
-   sensitivity limit from your own casts. **Test mode** recognises casts without running any actions.
+2. On the **Teach** page, pick the spell and press **Record 3 casts**. A cast that looks like a different spell is
+   rejected, so one stray motion can't spoil the set. On the third cast the spell unlocks.
+3. On the **Cast** page, cast anything. Recognised spells are named, the wand lights up and buzzes, and a sound
+   plays. Recognition also works when another page is open, so actions fire with the app in the background.
+4. **Check** (on Teach) runs a self-test of your recorded casts and tells you which spells get mixed up.
+   **Auto-tune** (on Cast) sets the sensitivity limit from your own casts. **Test mode** recognises casts without
+   running any actions.
 5. **Export** and **Import** share your recorded casts between PCs or friends.
 
-![The Cast page after recognising a spell](docs/screenshots/cast.png)
+![The Teach page](docs/screenshots/teach.png)
+
+![The Cast page: free casting](docs/screenshots/cast.png)
 
 ### Actions
 

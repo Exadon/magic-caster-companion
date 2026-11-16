@@ -207,6 +207,8 @@ def make_page(w, h, spine_on_right):
     edge = Image.new("RGB", (w, h), PARCH_DARK)
     rad = Image.radial_gradient("L").resize((w, h)).point(lambda v: max(0, v - 175) * 3)
     page = Image.composite(edge, base, rad)
+    if spine_on_right is None:      # one wide open spread with no spine
+        return page
     grad = Image.linear_gradient("L").rotate(90 if spine_on_right else -90).resize((w, h))
     shadow = grad.point(lambda v: max(0, v - 235) * 4)
     return Image.composite(Image.new("RGB", (w, h), (90, 60, 30)), page, shadow)
