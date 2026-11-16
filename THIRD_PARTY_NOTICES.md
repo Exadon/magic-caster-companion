@@ -31,6 +31,15 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
+## pystray
+
+- Project: https://github.com/moses-palmer/pystray
+- Used for: the system-tray icon (Windows backend).
+- Licence: GNU Lesser General Public License v3 (LGPLv3). It is used unmodified, as a separate library. The
+  packaged EXE contains it; you can replace it by building the app from source with a different version of
+  pystray (`pip install pystray`, then the PyInstaller command in the README). The licence text is at
+  https://www.gnu.org/licenses/lgpl-3.0.html.
+
 ## Trademarks
 
 Harry Potter and related names are trademarks of their respective owners. This project is an unofficial,

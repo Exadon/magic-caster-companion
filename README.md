@@ -13,7 +13,7 @@ from a Windows PC. No firmware is changed.
 
 ## What it does
 
-The app looks like a spell book, with a ribbon tab for each page (or press Ctrl+1 to Ctrl+6). A status line along
+The app looks like a spell book, with a ribbon tab for each page (or press Ctrl+1 to Ctrl+7). A status line along
 the bottom always shows, with a coloured dot, whether the wand and base are connected. Hover over any button for a
 hint. A soft page-turn sound plays as the pages turn (synthesised in code, so there is no audio file to ship);
 turn sounds off under **Lights > Preferences**.
@@ -23,8 +23,9 @@ turn sounds off under **Lights > Preferences**.
 | **Devices** | Connect the wand and base (one button, or each on its own). Model, firmware, battery, and the base's lid, wand-in-base and USB-power state. Connects and reconnects automatically |
 | **Spells** | Index of about 80 spells, each marked locked, learning or unlocked. Pick one to see its gesture diagram, a short description and how to cast it. Play its light and buzz effect, or set its colour and an **action** |
 | **Teach** | Unlock a spell: pick it, then cast it three times. Shows progress, lists the spells you are teaching, and can check, export and import your casts |
+| **Practice** | The app shows a spell, you cast it, and it tells you how it went. Hard spells come up more often. If the book gets one wrong you can add that cast to it with one click. Keeps a streak and per-spell accuracy |
 | **Cast** | Free casting on a full two-page spread. Cast anything: the book names the spells you have unlocked, with a live motion trace, a history of recent casts, your unlocked spells, and the recognition settings |
-| **Lights** | Set each LED group on the wand and the base's light, make the wand buzz, and set preferences |
+| **Lights** | Set each LED group on the wand and the base's light, make the wand buzz, choose the page-turn sound, and set the **Background** options (tray, notifications, start with Windows) |
 | **Notes** | Activity log, version, and credits |
 
 ### How spells unlock
@@ -50,7 +51,30 @@ each spell. That is what "teaching" means.
 
 ![The Teach page](docs/screenshots/teach.png)
 
+![The Practice page](docs/screenshots/practice.png)
+
 ![The Cast page: free casting](docs/screenshots/cast.png)
+
+### Running in the background
+
+The window's close button can keep the app running in the **system tray**, so the wand stays connected and your
+spell actions keep working with the window closed. Right-click the tray icon to open the book, turn recognition
+on or off, reconnect, or quit. A tooltip shows the wand and base status.
+
+Under **Lights > Background** you can choose what the close button does, get a tray notification when a spell is
+recognised while the window is hidden, and **start with Windows** (minimised to the tray). Start with Windows is
+off until you switch it on, and it only adds a per-user start-up entry. Launching the app a second time just shows
+the copy that is already running, because only one copy can talk to the wand.
+
+### The wand's own recognition (★)
+
+The wand recognises some spells by itself and reports them by name; so far Protego has been seen. When that
+happens the **Cast** page and history show it (marked "wand"), it plays the same effect and runs the same action,
+and the spell gets a ★ in the index. If the wand and the book both recognise the same cast it counts once
+("both"); if they disagree, the wand's answer is used. The **Stream motion** switch on the Cast page turns motion
+streaming off, so only the wand's own recognition is active (spells you taught then can't be recognised). The
+Cast page counts how many spells the wand has named, with streaming on and off, so you can see whether both work
+at the same time.
 
 ### Actions
 
@@ -80,11 +104,11 @@ python app.py
 
 Wake the wand with a wave, then press **Connect wand & base**.
 
-A standalone EXE can be built with PyInstaller:
+A standalone EXE can be built with PyInstaller (add `--exclude-module numpy` if numpy is installed):
 
 ```bash
 pip install pyinstaller
-python -m PyInstaller --noconfirm --onefile --windowed --name MagicCasterCompanion --icon assets/icon.ico --collect-submodules bleak --add-data "assets;assets" app.py
+python -m PyInstaller --noconfirm --onefile --windowed --name MagicCasterCompanion --icon assets/icon.ico --collect-submodules bleak --hidden-import pystray._win32 --add-data "assets;assets" app.py
 ```
 
 If a window is already connected to a device (for example a second copy of this app), the device stops

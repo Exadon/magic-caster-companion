@@ -277,6 +277,10 @@ def apply_styles(root):
                  indicatorbackground=FIELD, indicatorforeground=RED, upperbordercolor=PARCH_DARK,
                  lowerbordercolor=PARCH_DARK)
     st.map("Book.TCheckbutton", background=[("active", PARCH)], indicatorbackground=[("pressed", "#e6d6aa")])
+    st.configure("Card.TCheckbutton", background=CARD, foreground=INK, font=(SERIF, 11), focuscolor=CARD,
+                 indicatorbackground=FIELD, indicatorforeground=RED, upperbordercolor=PARCH_DARK,
+                 lowerbordercolor=PARCH_DARK)
+    st.map("Card.TCheckbutton", background=[("active", CARD)], indicatorbackground=[("pressed", "#e6d6aa")])
     root.option_add("*TCombobox*Listbox.background", FIELD)
     root.option_add("*TCombobox*Listbox.foreground", INK)
     root.option_add("*TCombobox*Listbox.font", (SERIF, 11))

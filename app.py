@@ -17,6 +17,7 @@ import gestures
 from actions import ACTION_TYPES, HINTS, play_cue, run_action, validate
 from gestures import UNLOCK_AT
 from mcwand import Box, LED_GROUPS, Wand, scan
+from practice import PracticeStats, evaluate, pick_target
 from settings import DATA_DIR, Settings
 from sounds import STYLE_LABELS, STYLES
 from spells_data import (CAST_STEPS, DESCRIPTIONS, SPELLS, diagram_paths, pretty, resource_path,
@@ -25,6 +26,7 @@ from ui_kit import (CARD, CARD_EDGE, FIELD, GOLD, INK, LEATHER, PARCH, PARCH_DAR
                     RoundButton, Tip, apply_styles, battery_color, battery_percent, ink_image, make_leather,
                     make_page, state_color, style_titlebar, tab_pil)
 from version import __version__
+from winintegration import SingleInstance, Tray, autostart_enabled, set_autostart
 
 W, H = 1000, 730
 BX0, BX1, BY0, BY1 = 30, 930, 25, 675
@@ -36,8 +38,10 @@ RETRY_S = 6                            # seconds between automatic reconnect att
 MUTED = "#7a6a4a"
 
 TABS = [("devices", "Devices", "#8a2323"), ("spells", "Spells", "#2f6b3a"), ("teach", "Teach", "#1f6b72"),
-        ("cast", "Cast", "#243f73"), ("lights", "Lights", "#b8862b"), ("notes", "Notes", "#5a2f6b")]
+        ("practice", "Practice", "#b5541f"), ("cast", "Cast", "#243f73"), ("lights", "Lights", "#b8862b"),
+        ("notes", "Notes", "#5a2f6b")]
 MARK = {"unlocked": "✦ ", "learning": "◇ ", "locked": "   "}
+FIRE_WINDOW_S = 2.5   # the wand and the book seeing the same cast within this window count as one cast
 STATE_TEXT = {"unlocked": "✦ Unlocked", "learning": "◇ Learning", "locked": "Locked"}
 
 
@@ -46,7 +50,7 @@ def hexcolor(rgb):
 
 
 class App(tk.Tk):
-    def __init__(self):
+    def __init__(self, start_hidden=False):
         super().__init__()
         self.title(f"Magic Caster Companion - Spell Book  v{__version__}")
         self.geometry(f"{W}x{H}")
@@ -87,6 +91,15 @@ class App(tk.Tk):
         self.store = gestures.GestureStore(os.path.join(DATA_DIR, "gestures.json"))
         self.seg = gestures.Segmenter()
         self.rec: dict | None = None
+        self.hidden = False                     # window hidden in the tray
+        self.tray: Tray | None = None
+        self._tray_hinted = False
+        self._recognising = True                # mirror of cast_mode that the tray thread may read safely
+        self._last_fire = None                  # (time, spell, source): de-duplicates wand + book recognition
+        self.pstats = PracticeStats(os.path.join(DATA_DIR, "practice.json"))
+        self.practice = {"active": False, "state": "idle", "target": None, "last": None, "streak": 0,
+                         "session": [], "result": None, "gesture": None, "token": 0, "msg": ""}
+        self.p_wins: dict = {}
         self.page = None
         self.busy = False
         self.widgets: list[tk.Widget] = []
@@ -100,11 +113,15 @@ class App(tk.Tk):
         self.c_note = tk.StringVar(value="")
         self.c_note.trace_add("write", lambda *_: self._set_item("note_item", self.c_note.get(), "cast"))
         self.cast_mode = tk.BooleanVar(value=True)
+        self.cast_mode.trace_add("write", lambda *_: self._recognising_changed())
         self.test_mode = tk.BooleanVar(value=self.settings.get("test_mode"))
         self.accept_var = tk.DoubleVar(value=self.settings.get("accept"))
         self.pref_vars = {k: tk.BooleanVar(value=self.settings.get(k))
                           for k in ("sounds", "auto_reconnect", "base_status_light")}
         self.stream_var = tk.BooleanVar(value=self.settings.get("streaming"))
+        self.bg_vars = {"tray": tk.BooleanVar(value=self.settings.get("close_to_tray") == "tray"),
+                        "notify": tk.BooleanVar(value=self.settings.get("tray_notify")),
+                        "autostart": tk.BooleanVar(value=autostart_enabled())}
         self.chip_font = None
         apply_styles(self)
 
@@ -133,10 +150,120 @@ class App(tk.Tk):
         self.after(50, self._poll)
         self.after(90, self._tick)
         self.after(150, lambda: style_titlebar(self))
-        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.protocol("WM_DELETE_WINDOW", self._on_close_request)
         self.show("devices", animate=False)
+        if not os.environ.get("MCC_NO_TRAY"):
+            self._setup_tray()
+        if start_hidden:
+            self._tray_hinted = True                 # starting minimised at sign-in: no "still running" notice
+            self.after(60, self.hide_to_tray)
         if self.settings.get("auto_reconnect") and not os.environ.get("MCC_NO_AUTOCONNECT"):
             self.after(1200, lambda: self.connect_all(quiet=True))
+
+    # ---------- tray, background and closing ----------
+    def _setup_tray(self):
+        try:
+            img = Image.open(resource_path(os.path.join("assets", "icon.ico"))).convert("RGBA").resize(
+                (64, 64), Image.LANCZOS)
+            self.tray = Tray(img, "Magic Caster Companion",
+                             on_open=lambda: self.ui(self.show_window),
+                             on_toggle_recognition=lambda: self.ui(self._toggle_recognition),
+                             is_recognising=lambda: self._recognising,
+                             on_connect=lambda: self.ui(self.connect_all),
+                             on_quit=lambda: self.ui(self._close))
+            self.tray.start()
+            self._refresh_status()
+        except Exception as e:                       # a missing tray must never stop the app from working
+            self.tray = None
+            self.log(f"System tray unavailable: {e}")
+
+    def _recognising_changed(self):
+        self._recognising = bool(self.cast_mode.get())
+        if self.tray:
+            self.tray.refresh_menu()
+
+    def _toggle_recognition(self):
+        self.cast_mode.set(not self.cast_mode.get())
+
+    def show_window(self):
+        self.hidden = False
+        self.deiconify()
+        self.state("normal")
+        self.lift()
+        self.attributes("-topmost", True)
+        self.after(250, lambda: self.attributes("-topmost", False))
+        self.focus_force()
+
+    def hide_to_tray(self):
+        if not self.tray:
+            return
+        self.hidden = True
+        self.withdraw()
+        if not self._tray_hinted:
+            self._tray_hinted = True
+            self.tray.notify("Still running in the tray, so your wand keeps working. Right-click the icon to quit.")
+
+    def _on_close_request(self):
+        """The window's X button: keep running in the tray, or quit, depending on the saved choice."""
+        if not self.tray:
+            self._close()
+            return
+        pref = self.settings.get("close_to_tray")
+        if pref == "tray":
+            self.hide_to_tray()
+        elif pref == "quit":
+            self._close()
+        else:
+            self._close_dialog()
+
+    def _close_dialog(self):
+        dlg = tk.Toplevel(self)
+        dlg.title("Close Magic Caster Companion?")
+        dlg.configure(bg=PARCH)
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.after(100, lambda: style_titlebar(dlg))
+        tk.Label(dlg, text="Keep running in the tray?", bg=PARCH, fg=RED, font=(SERIF, 18, "bold italic")).pack(
+            padx=22, pady=(16, 4), anchor="w")
+        tk.Label(dlg, text="In the tray the wand stays connected and your spell actions keep working, even with "
+                           "this window closed.", bg=PARCH, fg=INK, font=(SERIF, 11), wraplength=380,
+                 justify="left").pack(padx=22, anchor="w")
+        remember = tk.BooleanVar(value=False)
+        ttk.Checkbutton(dlg, text="Remember my choice", variable=remember, style="Book.TCheckbutton").pack(
+            padx=22, pady=(10, 0), anchor="w")
+        row = tk.Frame(dlg, bg=PARCH)
+        row.pack(padx=22, pady=(12, 16), anchor="e")
+
+        def choose(v):
+            if remember.get():
+                self.settings.set("close_to_tray", v)
+                self.bg_vars["tray"].set(v == "tray")
+            dlg.destroy()
+            if v == "tray":
+                self.hide_to_tray()
+            else:
+                self._close()
+        self.button("Keep running", lambda: choose("tray"), 0, 0, parent=row).pack(side="left", padx=3)
+        self.button("Quit", lambda: choose("quit"), 0, 0, parent=row).pack(side="left", padx=3)
+        self.button("Cancel", dlg.destroy, 0, 0, parent=row).pack(side="left", padx=3)
+        dlg.update_idletasks()
+        dlg.geometry("+%d+%d" % (self.winfo_rootx() + 270, self.winfo_rooty() + 230))
+        dlg.grab_set()
+
+    def _bg_changed(self, which):
+        on = bool(self.bg_vars[which].get())
+        if which == "tray":
+            self.settings.set("close_to_tray", "tray" if on else "quit")
+        elif which == "notify":
+            self.settings.set("tray_notify", on)
+        else:
+            ok = set_autostart(on)
+            if not ok:
+                self.bg_vars["autostart"].set(not on)
+                self.log("Could not change the start-with-Windows setting.")
+            else:
+                self.log("Will start with Windows, minimised to the tray." if on else
+                         "No longer starts with Windows.")
 
     # ---------- plumbing ----------
     def run(self, coro, done=None, failed=None):
@@ -240,6 +367,9 @@ class App(tk.Tk):
                     self.cv.itemconfig(fill_id, fill=battery_color(pct), state="normal" if pct else "hidden")
                 except tk.TclError:
                     pass
+        if getattr(self, "tray", None):
+            self.tray.set_title("Magic Caster Companion\n" + "\n".join(
+                self.cv.itemcget(self.foot[k][1], "text") for k in ("w", "b")))
 
     def log(self, msg):
         self.log_lines.append(msg)
@@ -268,9 +398,9 @@ class App(tk.Tk):
     def _draw_tabs(self):
         self.tab_ids, self.tab_imgs = {}, {}
         for i, (key, label, col) in enumerate(TABS):
-            y = BY0 + 28 + i * 100
+            y = BY0 + 24 + i * 88
             for st in ("normal", "hover", "active"):
-                self.tab_imgs[(key, st)] = ImageTk.PhotoImage(tab_pil(label, col, st, h=88))
+                self.tab_imgs[(key, st)] = ImageTk.PhotoImage(tab_pil(label, col, st, h=78))
             self.tab_ids[key] = self.cv.create_image(BX1 - 2, y, image=self.tab_imgs[(key, "normal")], anchor="nw",
                                                      tags=("tab", f"tab_{key}"))
             self.cv.tag_bind(f"tab_{key}", "<Button-1>", lambda _e, k=key: self.show(k))
@@ -345,8 +475,8 @@ class App(tk.Tk):
         b = RoundButton(parent or self, label, cmd, tip=tip, bg=bg)
         return self.put(b, x, y) if parent is None else b
 
-    def check(self, label, var, x, y, cmd=None):
-        cb = ttk.Checkbutton(self, text=label, variable=var, command=cmd, style="Book.TCheckbutton")
+    def check(self, label, var, x, y, cmd=None, style="Book.TCheckbutton"):
+        cb = ttk.Checkbutton(self, text=label, variable=var, command=cmd, style=style)
         return self.put(cb, x, y)
 
     def label(self, var, x, y, size=12, bold=False, width=None, bg=PARCH):
@@ -454,9 +584,9 @@ class App(tk.Tk):
     # ---------- page: spells ----------
     def _page_spells(self):
         self.text(LX, BY0 + 20, "Index of Spells", 24, bold=True, italic=True, color=RED)
-        n_un = len(self.store.unlocked())
-        self.text(LX, BY0 + 60, f"✦ unlocked   ◇ learning   no mark = locked      "
-                  f"{n_un} of {len(SPELLS)} unlocked", 10, italic=True)
+        n_un = len(set(self.store.unlocked()) | set(self.settings.get("wand_known")))
+        self.text(LX, BY0 + 60, f"✦ unlocked   ★ the wand knows it   ◇ learning      "
+                  f"{n_un} of {len(SPELLS)}", 10, italic=True)
         self.spell_filter = tk.StringVar()
         ent = tk.Entry(self, textvariable=self.spell_filter, bg=FIELD, fg=INK, relief="flat",
                        font=(SERIF, 12), highlightthickness=1, highlightbackground=PARCH_DARK,
@@ -487,7 +617,7 @@ class App(tk.Tk):
         self.spell_view = [s for s in SPELLS if q in s]
         self.spell_list.delete(0, "end")
         for s in self.spell_view:
-            self.spell_list.insert("end", MARK[self.store.state(s)] + pretty(s))
+            self.spell_list.insert("end", self._mark(s) + pretty(s))
             if s == self.sel_spell:
                 self.spell_list.selection_set("end")
                 self.spell_list.see("end")
@@ -528,6 +658,8 @@ class App(tk.Tk):
                    "learning": f"Recognised, but needs {UNLOCK_AT - n} more cast(s) to unlock fully.",
                    "locked": "The book can't recognise it yet. Teach it on the Teach page."}[st]
         info = f"{STATE_TEXT[st]}  ({n} recorded casts)\n{meaning}"
+        if s in self.settings.get("wand_known"):
+            info += "\n★ The wand recognises this spell by itself."
         act = self.settings.action(s)
         if act:
             info += f"\nOn cast: {act['type']} {act['value']}"
@@ -629,14 +761,189 @@ class App(tk.Tk):
             pass
         self._update_pips()
 
+    # ---------- page: practice ----------
+    def _pbtn(self, label, cmd, x, y, tip=None):
+        self.button(label, cmd, x, y, tip=tip)
+        return self.last_win
+
+    def _page_practice(self):
+        self.text(LX, BY0 + 20, "Practice", 24, bold=True, italic=True, color=RED)
+        self.card(LX - 14, BY0 + 62, LX + PAGE_W - 6, BY0 + 132)
+        self.text(LX + 4, BY0 + 70, "Cast the spell shown. The book tells you how it went, and if it gets one wrong "
+                  "you can teach it from the mistake.", 10, italic=True, width=PAGE_W - 24)
+        self.p_wins = {
+            "start": self._pbtn("Start practice", self._practice_start, LX, BY0 + 150,
+                                "Practise the spells you have taught, one after another"),
+            "stop": self._pbtn("Stop", self._practice_stop, LX, BY0 + 150),
+            "skip": self._pbtn("Skip spell", self._practice_next, LX + 96, BY0 + 150, "Try a different spell"),
+        }
+        self.text(RX, BY0 + 24, "Cast this spell", 20, bold=True)
+        self.p_wins["add"] = self._pbtn("Teach it this cast", self._practice_add, RX + 216, BY0 + 338,
+                                        "Add that cast to the book as an example of this spell")
+        self.p_wins["next"] = self._pbtn("Next spell", self._practice_next, RX + 216, BY0 + 386)
+        self._draw_practice()
+
+    def _practice_buttons(self):
+        p = self.practice
+        active, st, res = p["active"], p["state"], p["result"]
+        ok = bool(res and res["ok"])
+        want = {"start": not active, "stop": active, "skip": active and st == "waiting",
+                "add": bool(active and st == "result" and not ok and p["gesture"] is not None
+                            and not (res or {}).get("added")),
+                "next": bool(active and st == "result" and not ok)}
+        for k, wid in self.p_wins.items():
+            try:
+                self.cv.itemconfig(wid, state="normal" if want.get(k) else "hidden")
+            except tk.TclError:
+                pass
+
+    def _draw_practice(self):
+        self.cv.delete("plive")
+        tg = ("page", "plive")
+        p = self.practice
+        sess = p["session"]
+        hits = sum(1 for s in sess if s[1])
+        th, tt = self.pstats.totals()
+        self.card(LX - 14, BY0 + 206, LX + PAGE_W - 6, BY0 + 300, tags=tg)
+        self.text(LX + 4, BY0 + 214, f"This session: {hits} of {len(sess)}"
+                  + (f"  ({100 * hits // len(sess)}%)" if sess else ""), 13, bold=True, tags=tg, width=PAGE_W - 24)
+        self.text(LX + 4, BY0 + 242, f"Streak {p['streak']}   ·   Best streak {self.pstats.best_streak}", 11,
+                  tags=tg, width=PAGE_W - 24)
+        self.text(LX + 4, BY0 + 266, f"All time: {th} of {tt}" + (f"  ({100 * th // tt}%)" if tt else ""), 11,
+                  color=MUTED, tags=tg, width=PAGE_W - 24)
+        self.text(LX, BY0 + 318, "Recent attempts", 13, bold=True, tags=tg)
+        if not sess:
+            self.text(LX, BY0 + 346, "Nothing yet.", 11, italic=True, color=MUTED, tags=tg)
+        for i, (target, ok, got) in enumerate(reversed(sess[-9:])):
+            line = f"{'✓' if ok else '✗'}  {pretty(target)}"
+            if not ok:
+                line += f"   → {pretty(got) if got else 'not recognised'}"
+            self.text(LX, BY0 + 346 + i * 24, line, 12, bold=(i == 0), color=("#2f6b3a" if ok else "#7a4a2a"),
+                      tags=tg, width=PAGE_W)
+        self._practice_buttons()
+
+        target = p["target"]
+        if not p["active"] or not target:
+            self.text(RX, BY0 + 70, p["msg"] or "Press Start practice. You will be asked to cast spells you have "
+                      "taught, one after another, and the ones you find hard come up more often.", 12, italic=True,
+                      color=MUTED, tags=tg)
+        else:
+            self.text(RX, BY0 + 58, pretty(target), 24, bold=True, italic=True, color=RED, tags=tg)
+            self.text(RX, BY0 + 100, DESCRIPTIONS.get(target, ""), 11, italic=True, tags=tg)
+            paths = diagram_paths(target)
+            if paths:
+                iw = 190 if len(paths) == 1 else 100
+                self._practice_imgs = [ink_image(pa, iw) for pa in paths]
+                for i, im in enumerate(self._practice_imgs):
+                    self.cv.create_image(RX + i * (iw + 8), BY0 + 150, image=im, anchor="nw", tags=tg)
+            col_x, w = RX + 216 if len(paths) <= 1 else RX, 178
+            col_y = BY0 + 150 if len(paths) <= 1 else BY0 + 410
+            res = p["result"]
+            if p["state"] == "waiting":
+                self.text(col_x, col_y, "Cast it now...", 18, italic=True, color=MUTED, tags=tg, width=w)
+                self.text(col_x, col_y + 40, "Hold the wand in your normal grip, trace the shape, then hold still.",
+                          10, italic=True, color=MUTED, tags=tg, width=w)
+            elif res["ok"]:
+                self.text(col_x, col_y, "✓ Yes!", 28, bold=True, color="#2f6b3a", tags=tg, width=w)
+                detail = "The wand recognised it itself." if res["source"] == "wand" else \
+                    f"Distance {res['dist']:.2f}"
+                self.text(col_x, col_y + 50, detail + "\nNext spell in a moment...", 10, color=MUTED, tags=tg, width=w)
+            else:
+                self.text(col_x, col_y, "✗ Not quite", 22, bold=True, color="#7a4a2a", tags=tg, width=w)
+                said = (f"The book thought that was {pretty(res['got'])}." if res["got"] else
+                        "The book did not recognise that as any spell you have taught.")
+                if res["tdist"] is not None:
+                    said += f"\nDistance to {pretty(target)}: {res['tdist']:.2f}."
+                if res.get("added"):
+                    said += "\nAdded to the book. Try again!"
+                self.text(col_x, col_y + 40, said, 10, tags=tg, width=w)
+        weakest = self.pstats.weakest(3)
+        self.card(RX - 14, BY0 + 520, RX + PAGE_W + 6, BY0 + 640, tags=tg)
+        self.text(RX + 4, BY0 + 530, "Needs the most practice", 13, bold=True, color=RED, tags=tg)
+        if not weakest:
+            self.text(RX + 4, BY0 + 560, "Your weak spots will show up here as you practise.", 11, italic=True,
+                      color=MUTED, tags=tg, width=PAGE_W - 24)
+        for i, (name, rate, tries) in enumerate(weakest):
+            h, t = self.pstats.accuracy(name)
+            self.text(RX + 4, BY0 + 558 + i * 24, f"{pretty(name)}   {h} of {t}  ({int(rate * 100)}%)", 12, tags=tg,
+                      width=PAGE_W - 24)
+
+    def _practice_start(self):
+        p = self.practice
+        if not self.store.data:
+            p["msg"] = "You have not taught any spells yet. Open Teach and cast a spell three times first."
+        elif not (self.wand and self.wand.connected):
+            p["msg"] = "Connect your wand first, on the Devices page."
+        else:
+            p.update(active=True, streak=0, session=[], msg="", last=None)
+            self._practice_next()
+            return
+        self._draw_practice()
+
+    def _practice_next(self):
+        p = self.practice
+        if not p["active"]:
+            return
+        p["token"] += 1
+        p["target"] = pick_target(sorted(self.store.data), p["last"], self.pstats)
+        p["last"] = p["target"]
+        p.update(state="waiting", result=None, gesture=None)
+        if self.page == "practice":
+            self._draw_practice()
+
+    def _practice_stop(self):
+        p = self.practice
+        p.update(active=False, state="idle", result=None, gesture=None, target=None)
+        p["token"] += 1
+        if self.page == "practice":
+            self._draw_practice()
+
+    def _practice_listening(self):
+        p = self.practice
+        return bool(p["active"] and self.page == "practice" and p["target"] and
+                    (p["state"] == "waiting" or (p["state"] == "result" and not p["result"]["ok"])))
+
+    def _practice_cast(self, g):
+        p = self.practice
+        r = evaluate(self.store, g, p["target"], float(self.settings.get("accept")))
+        p["gesture"] = g
+        self._practice_result(r["ok"], r["got"], r["dist"], r["target_dist"], "book")
+
+    def _practice_native(self, key):
+        self._practice_result(key == self.practice["target"], key, None, None, "wand")
+
+    def _practice_result(self, ok, got, dist, tdist, source):
+        p = self.practice
+        target = p["target"]
+        p["streak"] = p["streak"] + 1 if ok else 0
+        self.pstats.record(target, ok, p["streak"])
+        p["session"].append((target, ok, got))
+        p["result"] = {"ok": ok, "got": got, "dist": dist, "tdist": tdist, "source": source, "added": False}
+        p["state"] = "result"
+        self.cue("success" if ok else "fail")
+        if ok:
+            self.wand_call("play", spell_effect(target, self.settings.color(target)))
+            tok = p["token"]
+            self.after(2200, lambda: self._practice_next() if (p["token"] == tok and p["active"]) else None)
+        self._draw_practice()
+
+    def _practice_add(self):
+        p = self.practice
+        if p["gesture"] is None or not p["target"] or not p["result"]:
+            return
+        self.store.add(p["target"], p["gesture"])
+        p["result"]["added"] = True
+        self.log(f"Added a cast to {pretty(p['target'])} from practice ({self.store.casts(p['target'])} casts)")
+        self._draw_practice()
+
     # ---------- page: cast (free casting, a full two-page spread) ----------
     def _page_cast(self):
         self.cv.create_image(BX0, BY0, image=self.spread_img, anchor="nw", tags="page")
         self.text(SX0, BY0 + 14, "Free Casting", 26, bold=True, italic=True, color=RED)
         self.text(SX0, BY0 + 60, "Cast any spell you like. The book recognises the ones you have unlocked.", 11,
                   italic=True, width=560)
-        unlocked = self.store.unlocked()
-        self.text(SX1, BY0 + 24, f"✦ {len(unlocked)} of {len(SPELLS)} spells unlocked", 14, bold=True,
+        usable = set(self.store.unlocked()) | set(self.settings.get("wand_known"))
+        self.text(SX1, BY0 + 24, f"✦ {len(usable)} of {len(SPELLS)} spells unlocked", 14, bold=True,
                   anchor="ne", width=320)
 
         self.text(SX0, BY0 + 96, "Motion", 12, bold=True)
@@ -649,6 +956,12 @@ class App(tk.Tk):
                             self._streaming_changed)
         Tip(stream, "On: the book learns and recognises spells you teach it. Off: only the spells the wand "
                     "recognises by itself are reported.")
+        ns = self.settings.get("native_stats")
+        heard = int(ns.get("streaming_on", 0)) + int(ns.get("streaming_off", 0))
+        self.text(SX0, BY0 + 338, (f"The wand has named {heard} spell(s) by itself (streaming on: "
+                                   f"{int(ns.get('streaming_on', 0))}, off: {int(ns.get('streaming_off', 0))})."
+                                   if heard else "The wand has not named a spell by itself yet."),
+                  9, italic=True, color=MUTED, width=270)
         self.card(SX0 + 280, BY0 + 90, SX1, BY0 + 330)
         self._draw_cast_live()
         self.ornament(SX0, BY0 + 352, SX1 - SX0)
@@ -678,7 +991,7 @@ class App(tk.Tk):
         if lc is None:
             self.text(mid, y0 + 78, "Cast a spell", 30, italic=True, color=MUTED, anchor="n", tags=tg)
             msg = ("Wave the wand to cast. Any spell you have unlocked is recognised here, and you can cast "
-                   "with this page closed too." if self.store.unlocked() else
+                   "with this page closed too." if (self.store.unlocked() or self.settings.get("wand_known")) else
                    "You have not unlocked any spells yet. Open Teach to unlock your first.")
             self.text(mid, y0 + 130, msg, 11, italic=True, color=MUTED, anchor="n", width=440, tags=tg)
             return
@@ -723,19 +1036,21 @@ class App(tk.Tk):
                 self.text(SX0, y, f"{clock}   ✦ {pretty(name)}", 12, bold=(i == 0), tags=tg, width=300)
             else:
                 self.text(SX0, y, f"{clock}   not recognised", 12, italic=True, color=MUTED, tags=tg, width=300)
-            self.text(SX0 + 380, y + 2, "wand" if src == "wand" else f"{dist:.2f}", 10, color=MUTED, anchor="ne",
-                      tags=tg, width=60)
+            self.text(SX0 + 380, y + 2, src if src in ("wand", "both") else f"{dist:.2f}", 10, color=MUTED,
+                      anchor="ne", tags=tg, width=60)
 
     def _draw_chips(self, x, y, w):
-        names = self.store.unlocked()
+        taught = self.store.unlocked()
+        names = [(n, "✦ ") for n in taught] + [(n, "★ ") for n in sorted(self.settings.get("wand_known"))
+                                                   if n not in taught]
         if not names:
             self.text(x, y, "None yet. Open the Teach page and cast a spell three times to unlock it.", 11,
                       italic=True, color=MUTED, width=w)
             self.button("Go to Teach", lambda: self.show("teach"), x, y + 56)
             return
         h, gap, cx, cy, shown = 26, 8, x, y, 0
-        for n in names:
-            label = "✦ " + pretty(n)
+        for n, mark in names:
+            label = mark + pretty(n)
             tw = self.chip_font.measure(label) + 22
             if cx + tw > x + w:
                 cx, cy = x, cy + h + gap
@@ -765,6 +1080,13 @@ class App(tk.Tk):
         self.text(LX, BY0 + 340, "Base light", 12, bold=True)
         self.button("Set base light", self.set_box_led, LX, BY0 + 368)
         self.button("All lights off", self.leds_off, LX, BY0 + 430)
+        self.card(LX - 14, BY0 + 492, LX + PAGE_W - 6, BY0 + 642)
+        self.text(LX + 4, BY0 + 502, "Background", 14, bold=True, color=RED)
+        for i, (key, label) in enumerate([("tray", "Keep running in the tray when I close the window"),
+                                          ("notify", "Notify me when a spell is recognised in the tray"),
+                                          ("autostart", "Start with Windows, minimised to the tray")]):
+            self.check(label, self.bg_vars[key], LX + 4, BY0 + 534 + i * 32, lambda k=key: self._bg_changed(k),
+                       style="Card.TCheckbutton")
 
         self.text(RX, BY0 + 24, "Buzz", 20, bold=True)
         self.text(RX, BY0 + 62, "Make the wand vibrate for a moment.", 10, italic=True)
@@ -1108,6 +1430,8 @@ class App(tk.Tk):
     def _gesture_done(self, g):
         if self.rec:
             self._record_step(g)
+        elif self._practice_listening():
+            self._practice_cast(g)
         elif self.cast_mode.get():
             self._cast(g)
 
@@ -1148,6 +1472,52 @@ class App(tk.Tk):
             self._flash(r["name"], self.settings.color(r["name"]) or spell_color(r["name"]),
                         f"{pretty(r['name'])} unlocked!")
 
+    def _dedupe(self, name, source):
+        """False if this recognition should not fire, because the other recogniser already handled the cast.
+
+        - Same spell reported by both the wand and the book within a moment: it counts once, and the history
+          entry is marked as seen by both.
+        - The wand named a DIFFERENT spell for this cast first: trust the wand and ignore the book's answer.
+        """
+        now = time.monotonic()
+        last, self._last_fire = self._last_fire, (now, name, source)
+        if last and last[2] != source and now - last[0] < FIRE_WINDOW_S:
+            if last[1] == name:
+                for i in range(len(self.cast_log) - 1, -1, -1):
+                    entry = self.cast_log[i]
+                    if entry[1] == name:
+                        self.cast_log[i] = entry[:3] + ("both",)
+                        break
+                if self.page == "cast":
+                    self._draw_history()
+                return False
+            if source == "book":
+                self.log(f"The wand named {pretty(last[1])} for this cast, so the book's "
+                         f"{pretty(name)} was ignored.")
+                return False
+        return True
+
+    def _note_native(self, key):
+        """Remember which spells the wand recognises by itself, and count them by streaming state."""
+        ns = dict(self.settings.get("native_stats"))
+        field = "streaming_on" if self.settings.get("streaming") else "streaming_off"
+        ns[field] = int(ns.get(field, 0)) + 1
+        self.settings.set("native_stats", ns)
+        known = list(self.settings.get("wand_known"))
+        if key and key not in known:
+            known.append(key)
+            self.settings.set("wand_known", known)
+            self.log(f"The wand knows {pretty(key)} by itself.")
+
+    def _mark(self, s):
+        """Index mark: unlocked (taught), the wand knows it, learning, or locked."""
+        st = self.store.state(s)
+        if st == "unlocked":
+            return MARK["unlocked"]
+        if s in self.settings.get("wand_known"):
+            return "★ "
+        return MARK[st]
+
     def _streaming_changed(self):
         on = bool(self.stream_var.get())
         self.settings.set("streaming", on)
@@ -1164,6 +1534,12 @@ class App(tk.Tk):
         key = spell_key(raw)
         known = key in SPELLS
         self.log(f"Wand recognised: {raw}" + ("" if known else "  (not in this book's list)"))
+        self._note_native(key if known else None)
+        if known and self._practice_listening():
+            self._practice_native(key)
+            return
+        if known and not self._dedupe(key, "wand"):
+            return                       # the book already recognised this same cast: it counts once
         self.last_cast = {"name": key if known else None, "raw": raw, "native": True, "dist": 0.0,
                           "limit": 0.0, "near": []}
         self.cast_log.append((time.strftime("%H:%M:%S"), key if known else raw, 0.0, "wand"))
@@ -1184,6 +1560,9 @@ class App(tk.Tk):
         accept = float(self.settings.get("accept"))
         best, dist, scores = self.store.match(g, accept)
         near = sorted(scores.items(), key=lambda kv: kv[1])[:4]
+        if best and not self._dedupe(best, "book"):
+            self.log(f"Cast {pretty(best)} d={dist:.2f} (already handled via the wand)")
+            return                       # the wand already reported this same cast: it counts once
         self.last_cast = {"name": best, "dist": dist, "limit": accept, "near": near}
         self.cast_log.append((time.strftime("%H:%M:%S"), best, dist, "book"))
         self.cast_log = self.cast_log[-50:]
@@ -1200,7 +1579,9 @@ class App(tk.Tk):
         """A spell was recognised (by the book or by the wand): sound, glow, wand effect, then its action."""
         self.cue("success")
         col = self.settings.color(best) or spell_color(best)
-        if self.page != "cast":          # the Cast page shows the result itself
+        if self.hidden and self.tray and self.settings.get("tray_notify"):
+            self.tray.notify(f"{pretty(best)} recognised")
+        if self.page != "cast" and not self.hidden:          # the Cast page shows the result itself
             self._flash(best, col)
         self.wand_call("play", spell_effect(best, self.settings.color(best)))
         act = self.settings.action(best)
@@ -1285,6 +1666,8 @@ class App(tk.Tk):
         self.t_status.set(f"Imported {n} casts.")
 
     def _close(self):
+        if self.tray:
+            self.tray.stop()
         for d in (self.wand, self.box):
             if d and d.connected:
                 try:
@@ -1332,6 +1715,18 @@ def _screenshots(app: App, outdir: str, demo: bool = True):
         app.t_status.set("Protego: cast 2 of 3. Make the motion now...")
         app.sel_spell = "protego"
         app.accept_var.set(0.9)       # documentation shows the default, not whatever this PC has saved
+        app.settings.data["wand_known"] = ["protego", "wingardium_leviosa"]
+        app.settings.data["native_stats"] = {"streaming_on": 1, "streaming_off": 2}
+        app.pstats.spells = {"lumos": {"tries": 5, "hits": 2}, "nox": {"tries": 4, "hits": 4},
+                             "accio": {"tries": 6, "hits": 3}, "stupefy": {"tries": 3, "hits": 1}}
+        app.pstats.best_streak = 5
+        app.practice.update(active=True, state="result", target="stupefy", last="stupefy", streak=0,
+                            gesture=[[0.0] * 6] * 10, session=[("lumos", True, "lumos"), ("nox", True, "nox"),
+                                                                ("accio", False, "stupefy"),
+                                                                ("protego", True, "protego"),
+                                                                ("stupefy", False, "nox")],
+                            result={"ok": False, "got": "nox", "dist": 0.78, "tdist": 1.02, "source": "book",
+                                    "added": False})
 
     def grab(i=0):
         if i >= len(keys):
@@ -1391,10 +1786,20 @@ if __name__ == "__main__":
     if shots:  # never connect to devices or touch real user data when taking screenshots
         import tempfile
         os.environ["MCC_NO_AUTOCONNECT"] = "1"
+        os.environ["MCC_NO_TRAY"] = "1"
         d = tempfile.mkdtemp()
-    a = App()
+    instance = None
+    if not shots:                      # only one copy may talk to the wand: a second launch shows the first
+        instance = SingleInstance()
+        if instance.already_running:
+            instance.ask_existing_to_show()
+            sys.exit(0)
+    a = App(start_hidden=("--minimized" in sys.argv and not shots))
+    if instance:
+        instance.watch(lambda: a.ui(a.show_window))
     if shots:
         a.settings = Settings(os.path.join(d, "s.json"))
         a.store = gestures.GestureStore(os.path.join(d, "g.json"))
+        a.pstats = PracticeStats(os.path.join(d, "p.json"))
         _screenshots(a, sys.argv[2])
     a.mainloop()

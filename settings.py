@@ -9,6 +9,10 @@ DEFAULTS = {
     "sounds": True,
     "auto_reconnect": True,
     "base_status_light": True,
+    "close_to_tray": "ask",   # what the window's X button does: ask / tray / quit
+    "tray_notify": True,      # tray notification when a spell is recognised while the window is hidden
+    "wand_known": [],         # spells the wand has recognised by itself at least once
+    "native_stats": {"streaming_on": 0, "streaming_off": 0},   # wand-recognised spells, by streaming state
     "page_sound": "soft",     # soft / crisp / heavy
     "page_volume": 0.6,       # 0..1
     "streaming": True,        # stream the wand's motion (needed for spells you teach); off = built-in recognition only
