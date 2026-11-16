@@ -142,6 +142,21 @@ async with Wand(found["wand"]["address"]) as w:
   you cast it (hard and gentle casts of the same spell look alike).
 - The four `0x10` touch-sensor events, LED, buzz, motion and base status messages are implemented. See `mcwand.py`.
 
+## Project layout
+
+| File | What it does |
+|---|---|
+| `app.py` | Entry point and the `App` window (state, drawing surface, book chrome) |
+| `pages/` | One module per page: `devices`, `spells`, `teach`, `practice`, `cast`, `lights`, `notes` |
+| `connection.py` | Finding, connecting to and reconnecting the wand and base |
+| `casting.py` | Turning wand motion and wand reports into recognised casts, effects and actions |
+| `shell.py` | System tray, running in the background, closing the window |
+| `common.py` | Shared imports, layout constants and helpers |
+| `mcwand.py` | The Bluetooth library for the wand and base |
+| `gestures.py`, `practice.py` | Gesture matching and practice logic |
+| `actions.py`, `sounds.py`, `settings.py` | What a spell can trigger, synthesised sounds, saved settings |
+| `ui_kit.py`, `spells_data.py`, `winintegration.py` | Visual building blocks, the spell catalogue, Windows integration |
+
 ## Development
 
 ```bash
