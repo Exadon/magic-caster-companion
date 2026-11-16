@@ -29,7 +29,7 @@ BX0, BX1, BY0, BY1 = 30, 930, 25, 675
 SPINE = (BX0 + BX1) // 2
 LX, RX = BX0 + 28, SPINE + 28          # left/right page content origins
 PAGE_W = SPINE - BX0 - 56              # usable content width of a page
-RETRY_S = 10                           # seconds between automatic reconnect attempts
+RETRY_S = 6                            # seconds between automatic reconnect attempts
 
 TABS = [("devices", "Devices", "#8a2323"), ("spells", "Spells", "#2f6b3a"),
         ("cast", "Cast", "#243f73"), ("lights", "Lights", "#b8862b"),
