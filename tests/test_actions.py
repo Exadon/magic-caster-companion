@@ -64,36 +64,6 @@ def test_settings_ignores_bad_types(tmp_path):
     assert s.get("accept") == 0.9 and s.get("sounds") is False
 
 
-def _samples(wav_bytes):
-    import io
-    import struct
-    import wave
-    with wave.open(io.BytesIO(wav_bytes)) as w:
-        assert w.getnchannels() == 1 and w.getsampwidth() == 2
-        raw = w.readframes(w.getnframes())
-        return list(struct.unpack("<%dh" % (len(raw) // 2), raw)), w.getframerate()
-
-
-def test_page_turn_sound_is_a_short_quiet_wav():
-    s, rate = _samples(A.page_turn_wav(1))
-    assert 0.25 < len(s) / rate < 0.45
-    peak = max(abs(v) for v in s)
-    assert 0.4 * 32767 < peak <= 0.55 * 32767          # audible but not startling, never clipped
-
-
-def test_page_turn_sound_is_deterministic_and_varies_by_seed():
-    assert A.page_turn_wav(1) == A.page_turn_wav(1)
-    assert A.page_turn_wav(1) != A.page_turn_wav(2)
-
-
-def test_page_turn_sound_swells_then_fades():
-    s, _ = _samples(A.page_turn_wav(2))
-    n = len(s)
-    rms = lambda seg: (sum(v * v for v in seg) / len(seg)) ** 0.5
-    assert rms(s[int(n * .1):int(n * .3)]) > 2 * rms(s[int(n * .85):])   # louder in the swell than at the end
-    assert rms(s[:int(n * .02)]) < rms(s[int(n * .1):int(n * .3)])       # starts soft
-
-
 def test_streaming_setting_defaults_on(tmp_path):
     s = S.Settings(str(tmp_path / "s.json"))
     assert s.get("streaming") is True

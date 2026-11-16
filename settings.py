@@ -9,6 +9,8 @@ DEFAULTS = {
     "sounds": True,
     "auto_reconnect": True,
     "base_status_light": True,
+    "page_sound": "soft",     # soft / crisp / heavy
+    "page_volume": 0.6,       # 0..1
     "streaming": True,        # stream the wand's motion (needed for spells you teach); off = built-in recognition only
     "test_mode": False,       # recognise casts but don't run actions
     "colors": {},             # spell -> [r, g, b]

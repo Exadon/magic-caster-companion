@@ -18,6 +18,7 @@ from actions import ACTION_TYPES, HINTS, play_cue, run_action, validate
 from gestures import UNLOCK_AT
 from mcwand import Box, LED_GROUPS, Wand, scan
 from settings import DATA_DIR, Settings
+from sounds import STYLE_LABELS, STYLES
 from spells_data import (CAST_STEPS, DESCRIPTIONS, SPELLS, diagram_paths, pretty, resource_path,
                          spell_color, spell_effect, spell_key)
 from ui_kit import (CARD, CARD_EDGE, FIELD, GOLD, INK, LEATHER, PARCH, PARCH_DARK, RED, SERIF,
@@ -254,7 +255,14 @@ class App(tk.Tk):
 
     def cue(self, name):
         if self.settings.get("sounds"):
-            play_cue(name)
+            if name == "page":
+                play_cue("page", style=self.settings.get("page_sound"), volume=self.settings.get("page_volume"))
+            else:
+                play_cue(name)
+
+    def _preview_page_sound(self):
+        """Play the page-turn sound with the current choice, even if sound effects are switched off."""
+        play_cue("page", style=self.settings.get("page_sound"), volume=self.settings.get("page_volume"))
 
     # ---------- book chrome ----------
     def _draw_tabs(self):
@@ -770,6 +778,23 @@ class App(tk.Tk):
                                           ("auto_reconnect", "Connect and reconnect automatically"),
                                           ("base_status_light", "Show wand status on the base's light")]):
             self.check(label, self.pref_vars[key], RX, BY0 + 312 + i * 32, lambda k=key: self._pref_changed(k))
+        self.ornament(RX, BY0 + 424)
+        self.text(RX, BY0 + 438, "Page-turn sound", 18, bold=True)
+        labels = [STYLE_LABELS[s] for s in STYLES]
+        combo = ttk.Combobox(self, style="Book.TCombobox", values=labels, state="readonly", width=16,
+                             font=(SERIF, 11))
+        combo.set(STYLE_LABELS.get(self.settings.get("page_sound"), labels[0]))
+
+        def style_picked(_e):
+            self.settings.set("page_sound", STYLES[labels.index(combo.get())])
+            self._preview_page_sound()
+        combo.bind("<<ComboboxSelected>>", style_picked)
+        self.put(combo, RX, BY0 + 474)
+        self.button("Play", self._preview_page_sound, RX + 190, BY0 + 468, tip="Hear the page-turn sound")
+        self.slider(RX, BY0 + 516, "Volume", float(self.settings.get("page_volume")), 0.0, 1.0, 0.05, 240,
+                    lambda v: f"{int(round(v * 100))}%",
+                    on_change=lambda v: self.settings.data.__setitem__("page_volume", round(v, 2)),
+                    on_release=lambda: (self.settings.save(), self._preview_page_sound()))
 
     def _pref_changed(self, key):
         self.settings.set(key, bool(self.pref_vars[key].get()))
