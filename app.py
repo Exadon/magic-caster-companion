@@ -9,7 +9,7 @@ import time
 import tkinter as tk
 from tkinter import colorchooser, filedialog, messagebox, ttk
 
-from PIL import Image, ImageChops, ImageFilter, ImageTk
+from PIL import Image, ImageTk
 
 import gestures
 from actions import ACTION_TYPES, HINTS, play_cue, run_action, validate
@@ -17,13 +17,11 @@ from mcwand import Box, LED_GROUPS, Wand, scan
 from settings import DATA_DIR, Settings
 from spells_data import (CAST_STEPS, DESCRIPTIONS, SPELLS, diagram_paths, pretty, resource_path,
                          spell_color, spell_effect)
+from ui_kit import (CARD, CARD_EDGE, FIELD, GOLD, INK, LEATHER, PARCH, PARCH_DARK, RED, SERIF, TEXT_ON_DARK,
+                    RoundButton, Tip, apply_styles, battery_color, battery_percent, ink_image, make_leather,
+                    make_page, state_color, style_titlebar)
 from version import __version__
 
-SERIF = "Palatino Linotype"
-PARCH, PARCH_DARK = "#e8d9b5", "#b89a62"
-FIELD = "#f3e8c8"
-INK, INK_RGB = "#3a2412", (58, 36, 18)
-RED, GOLD, LEATHER = "#7a1f1f", "#c9a227", "#2b1a10"
 W, H = 1000, 730
 BX0, BX1, BY0, BY1 = 30, 930, 25, 675
 SPINE = (BX0 + BX1) // 2
@@ -38,39 +36,6 @@ TABS = [("devices", "Devices", "#8a2323"), ("spells", "Spells", "#2f6b3a"),
 
 def hexcolor(rgb):
     return "#%02x%02x%02x" % tuple(int(x) for x in rgb)
-
-
-def make_page(w, h, spine_on_right):
-    """Procedural parchment: flat centre, darker edges, shadow toward the spine."""
-    base = Image.new("RGB", (w, h), PARCH)
-    edge = Image.new("RGB", (w, h), PARCH_DARK)
-    rad = Image.radial_gradient("L").resize((w, h)).point(lambda v: max(0, v - 175) * 3)
-    page = Image.composite(edge, base, rad)
-    grad = Image.linear_gradient("L").rotate(90 if spine_on_right else -90).resize((w, h))
-    shadow = grad.point(lambda v: max(0, v - 235) * 4)
-    return Image.composite(Image.new("RGB", (w, h), (90, 60, 30)), page, shadow)
-
-
-def make_leather(w, h):
-    base = Image.new("RGB", (w, h), (46, 28, 17))
-    noise = Image.effect_noise((w, h), 22).convert("RGB")
-    return Image.blend(base, noise, 0.10)
-
-
-_ink_cache = {}
-
-
-def ink_image(path, width):
-    key = (path, width)
-    if key not in _ink_cache:
-        im = Image.open(path).convert("RGBA")
-        mask = ImageChops.multiply(im.getchannel("A"), im.convert("L"))
-        mask = mask.filter(ImageFilter.MaxFilter(3))
-        ink = Image.new("RGBA", im.size, INK_RGB + (255,))
-        ink.putalpha(mask)
-        h = int(im.height * width / im.width)
-        _ink_cache[key] = ImageTk.PhotoImage(ink.resize((width, h), Image.LANCZOS))
-    return _ink_cache[key]
 
 
 class App(tk.Tk):
@@ -102,6 +67,9 @@ class App(tk.Tk):
         self.meter = None
         self.status_item = None
         self.scores_item = None
+        self.empty_item = None
+        self.dev_dots: dict = {}
+        self.batt_bars: dict = {}
         self.log_lines: list[str] = []
         self.logbox: tk.Text | None = None
         self.store = gestures.GestureStore(os.path.join(DATA_DIR, "gestures.json"))
@@ -122,20 +90,11 @@ class App(tk.Tk):
         self.accept_var = tk.DoubleVar(value=self.settings.get("accept"))
         self.pref_vars = {k: tk.BooleanVar(value=self.settings.get(k))
                           for k in ("sounds", "auto_reconnect", "base_status_light")}
-
-        style = ttk.Style(self)
-        style.theme_use("clam")
-        style.configure("Book.TCombobox", fieldbackground=FIELD, background=PARCH_DARK, foreground=INK,
-                        arrowcolor=INK, bordercolor=PARCH_DARK, selectbackground=FIELD, selectforeground=INK)
-        style.map("Book.TCombobox", fieldbackground=[("readonly", FIELD)], foreground=[("readonly", INK)],
-                  selectbackground=[("readonly", FIELD)], selectforeground=[("readonly", INK)])
-        self.option_add("*TCombobox*Listbox.background", FIELD)
-        self.option_add("*TCombobox*Listbox.foreground", INK)
-        self.option_add("*TCombobox*Listbox.font", (SERIF, 11))
+        apply_styles(self)
 
         self.cv = tk.Canvas(self, width=W, height=H, highlightthickness=0, bg=LEATHER)
         self.cv.pack()
-        self.leather = ImageTk.PhotoImage(make_leather(W, H))
+        self.leather = ImageTk.PhotoImage(make_leather(W, H, (BX0, BY0, BX1, BY1)))
         self.cv.create_image(0, 0, image=self.leather, anchor="nw")
         self.cv.create_rectangle(BX0 - 10, BY0 - 10, BX1 + 10, BY1 + 10, outline=GOLD, width=3)
         self.cv.create_rectangle(BX0 - 5, BY0 - 5, BX1 + 5, BY1 + 5, outline="#6b4a1e", width=6)
@@ -145,14 +104,17 @@ class App(tk.Tk):
         self.cv.create_image(BX0, BY0, image=self.left_img, anchor="nw")
         self.cv.create_image(SPINE, BY0, image=self.right_img, anchor="nw")
         self.cv.create_line(SPINE, BY0, SPINE, BY1, fill="#5a3c1c", width=2)
-        self.ribbon = self.cv.create_text(W // 2, H - 24, text="", fill="#d9c07a", font=(SERIF, 12, "italic"))
+        self._draw_footer()
         for k in ("w_state", "w_batt", "b_state", "b_batt"):
-            self.vars[k].trace_add("write", lambda *_: self._ribbon())
-        self._ribbon()
+            self.vars[k].trace_add("write", lambda *_: self._refresh_status())
+        self._refresh_status()
         self._draw_tabs()
+        for i, (key, _l, _c) in enumerate(TABS):
+            self.bind_all(f"<Control-Key-{i + 1}>", lambda _e, k=key: self.show(k))
 
         self.after(50, self._poll)
         self.after(90, self._tick)
+        self.after(150, lambda: style_titlebar(self))
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.show("devices", animate=False)
         if self.settings.get("auto_reconnect") and not os.environ.get("MCC_NO_AUTOCONNECT"):
@@ -202,13 +164,40 @@ class App(tk.Tk):
             except tk.TclError:
                 self.status_item = None
 
-    def _ribbon(self):
+    def _draw_footer(self):
+        y = H - 24
+        self.foot = {}
+        for key, x in (("w", W // 2 - 250), ("b", W // 2 + 30)):
+            dot = self.cv.create_oval(x, y - 6, x + 12, y + 6, fill="#8c7b62", outline="#1a0f08")
+            txt = self.cv.create_text(x + 20, y, anchor="w", text="", fill="#d9c07a", font=(SERIF, 12, "italic"))
+            self.foot[key] = (dot, txt)
+        self.cv.create_text(W - 20, y, anchor="e", text=f"v{__version__}", fill="#8a7347", font=(SERIF, 10))
+
+    def _refresh_status(self):
+        """Footer, device-page dots and battery bars follow the status variables."""
         def short(s):
-            return s if len(s) <= 38 else s[:36] + "..."
-        wb = f" ({self.vars['w_batt'].get()})" if self.vars["w_state"].get() == "connected" else ""
-        bb = f" ({self.vars['b_batt'].get()})" if self.vars["b_state"].get() == "connected" else ""
-        self.cv.itemconfig(self.ribbon, text=f"Wand: {short(self.vars['w_state'].get())}{wb}     ✦     "
-                                             f"Base: {short(self.vars['b_state'].get())}{bb}")
+            return s if len(s) <= 30 else s[:28] + "..."
+        for key, name, sv, bv in (("w", "Wand", "w_state", "w_batt"), ("b", "Base", "b_state", "b_batt")):
+            state = self.vars[sv].get()
+            batt = self.vars[bv].get() if state == "connected" else ""
+            dot, txt = self.foot[key]
+            self.cv.itemconfig(dot, fill=state_color(state))
+            self.cv.itemconfig(txt, text=f"{name}: {short(state)}" + (f"  {batt}" if batt else ""))
+            d = self.dev_dots.get(key)
+            if d is not None:
+                try:
+                    self.cv.itemconfig(d, fill=state_color(state))
+                except tk.TclError:
+                    pass
+            bar = self.batt_bars.get(key)
+            if bar is not None:
+                pct = battery_percent(self.vars[bv].get()) if state == "connected" else None
+                x, y, w, h, fill_id = bar
+                try:
+                    self.cv.coords(fill_id, x + 1, y + 1, x + 1 + max(0, (w - 2) * (pct or 0) / 100), y + h - 1)
+                    self.cv.itemconfig(fill_id, fill=battery_color(pct), state="normal" if pct else "hidden")
+                except tk.TclError:
+                    pass
 
     def log(self, msg):
         self.log_lines.append(msg)
@@ -233,7 +222,7 @@ class App(tk.Tk):
             y = BY0 + 40 + i * 104
             r = self.cv.create_rectangle(BX1 - 2, y, BX1 + 56, y + 92, fill=col, outline=GOLD, width=2,
                                          tags=("tab", f"tab_{key}"))
-            t = self.cv.create_text(BX1 + 27, y + 46, text=label, fill="#f3e6c4", angle=270,
+            t = self.cv.create_text(BX1 + 27, y + 46, text=label, fill=TEXT_ON_DARK, angle=270,
                                     font=(SERIF, 13, "bold"), tags=("tab", f"tab_{key}"))
             self.tab_ids[key] = (r, t, y, col)
             self.cv.tag_bind(f"tab_{key}", "<Button-1>", lambda _e, k=key: self.show(k))
@@ -258,6 +247,8 @@ class App(tk.Tk):
         self.logbox = None
         self.status_item = None
         self.scores_item = None
+        self.empty_item = None
+        self.dev_dots, self.batt_bars = {}, {}
 
     def show(self, page, animate=True):
         if self.busy or (page == self.page and animate):
@@ -286,11 +277,12 @@ class App(tk.Tk):
     def _build(self, page):
         self.cv.delete("flip")
         getattr(self, f"_page_{page}")()
+        self._refresh_status()
 
-    # widget helpers
+    # ---------- widget helpers ----------
     def put(self, widget, x, y, anchor="nw", **kw):
         self.widgets.append(widget)
-        self.cv.create_window(x, y, window=widget, anchor=anchor, tags="page", **kw)
+        self.last_win = self.cv.create_window(x, y, window=widget, anchor=anchor, tags="page", **kw)
         return widget
 
     def text(self, x, y, s, size=11, bold=False, italic=False, color=INK, width=PAGE_W, anchor="nw", **kw):
@@ -299,50 +291,115 @@ class App(tk.Tk):
         return self.cv.create_text(x, y, text=s, fill=color, anchor=anchor, width=width,
                                    font=(SERIF, size, style), tags=tags, **kw)
 
-    def button(self, label, cmd, x, y, width=None, parent=None):
-        b = tk.Button(parent or self, text=label, command=cmd, bg="#5b3a24", fg="#f3e6c4", relief="flat",
-                      activebackground="#7a5236", activeforeground="#fff7dc", cursor="hand2",
-                      font=(SERIF, 11, "bold"), padx=12, pady=5, bd=0, width=width or 0)
+    def button(self, label, cmd, x, y, parent=None, tip=None, bg=PARCH):
+        b = RoundButton(parent or self, label, cmd, tip=tip, bg=bg)
         return self.put(b, x, y) if parent is None else b
 
     def check(self, label, var, x, y, cmd=None):
-        cb = tk.Checkbutton(self, text=label, variable=var, command=cmd, bg=PARCH, fg=INK,
-                            activebackground=PARCH, selectcolor=FIELD, font=(SERIF, 11), anchor="w")
+        cb = ttk.Checkbutton(self, text=label, variable=var, command=cmd, style="Book.TCheckbutton")
         return self.put(cb, x, y)
 
-    def label(self, var, x, y, size=12, bold=False, width=None):
-        lb = tk.Label(self, textvariable=var, bg=PARCH, fg=INK, font=(SERIF, size, "bold" if bold else "normal"),
+    def label(self, var, x, y, size=12, bold=False, width=None, bg=PARCH):
+        lb = tk.Label(self, textvariable=var, bg=bg, fg=INK, font=(SERIF, size, "bold" if bold else "normal"),
                       anchor="w", justify="left", wraplength=width or 0)
         return self.put(lb, x, y)
+
+    def slider(self, x, y, title, value, lo, hi, step, length, fmt, on_change=None, on_release=None):
+        """Titled ttk slider with a live value readout. Returns the Scale."""
+        self.text(x, y, title, 10, italic=True)
+        readout = tk.Label(self, text=fmt(value), bg=PARCH, fg=INK, font=(SERIF, 11, "bold"), width=6, anchor="e")
+        self.put(readout, x + length + 8, y + 18)
+
+        def moved(v):
+            val = round(float(v) / step) * step
+            readout.configure(text=fmt(val))
+            if on_change:
+                on_change(val)
+        sc = ttk.Scale(self, from_=lo, to=hi, orient="horizontal", length=length, style="Book.Horizontal.TScale",
+                       command=moved)
+        sc.set(value)
+        if on_release:
+            sc.bind("<ButtonRelease-1>", lambda _e: on_release())
+        self.put(sc, x, y + 20)
+        return sc
 
     def rule(self, x, y, w=PAGE_W):
         self.cv.create_line(x, y, x + w, y, fill="#8a6b3a", width=1, tags="page")
 
-    # ---------- page: devices ----------
-    def _page_devices(self):
-        self.text(LX, BY0 + 30, "Magic Caster\nCompanion", 28, bold=True, italic=True, color=RED)
-        self.rule(LX, BY0 + 125)
-        self.text(LX, BY0 + 140, "The Wand", 20, bold=True)
-        for i, (k, name) in enumerate([("w_state", "Status"), ("w_info", "Model"), ("w_batt", "Battery")]):
-            self.text(LX, BY0 + 190 + i * 32, name, 12, italic=True, width=100)
-            self.label(self.vars[k], LX + 110, BY0 + 188 + i * 32, 12, width=280)
-        self.button("Connect wand", lambda: self.connect("wand"), LX, BY0 + 300)
-        self.button("Disconnect", lambda: self.disconnect("wand"), LX + 160, BY0 + 300)
-        self.rule(LX, BY0 + 370)
-        self.button("Connect wand & base", self.connect_all, LX, BY0 + 390)
-        self.button("Scan only", self.do_scan, LX + 230, BY0 + 390)
-        self.text(LX, BY0 + 440, "Wake the wand first by giving it a wave. Connect scans for you, and reconnects "
-                  "automatically if the link drops (change this on the Lights page).", 10, italic=True)
+    def ornament(self, x, y, w=PAGE_W):
+        mid = x + w // 2
+        self.cv.create_line(x, y, mid - 18, y, fill="#9a7b45", width=1, tags="page")
+        self.cv.create_line(mid + 18, y, x + w, y, fill="#9a7b45", width=1, tags="page")
+        self.cv.create_text(mid, y, text="✦", fill="#9a7b45", font=(SERIF, 12), tags="page")
 
-        self.text(RX, BY0 + 30, "The Base", 20, bold=True)
-        self.text(RX, BY0 + 62, "Magic Caster Box", 11, italic=True)
-        rows = [("b_state", "Status"), ("b_info", "Firmware"), ("b_batt", "Battery"), ("b_lid", "Lid"),
-                ("b_wand", "Wand in base"), ("b_usb", "USB power")]
-        for i, (k, name) in enumerate(rows):
-            self.text(RX, BY0 + 110 + i * 32, name, 12, italic=True, width=130)
-            self.label(self.vars[k], RX + 140, BY0 + 108 + i * 32, 12, width=240)
-        self.button("Connect base", lambda: self.connect("box"), RX, BY0 + 330)
-        self.button("Disconnect", lambda: self.disconnect("box"), RX + 160, BY0 + 330)
+    def card(self, x0, y0, x1, y1, r=14):
+        pts = [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1, x1 - r, y1, x0 + r, y1, x0, y1,
+               x0, y1 - r, x0, y0 + r, x0, y0]
+        return self.cv.create_polygon(pts, smooth=True, fill=CARD, outline=CARD_EDGE, width=1.5, tags="page")
+
+    # ---------- page: devices ----------
+    def _device_card(self, key, x, y, w, h, title, subtitle, rows, on_connect, on_disconnect):
+        """rows: (label, var name, kind) with kind 'text', 'status' (dot) or 'battery' (bar)."""
+        self.card(x - 14, y, x + w + 14, y + h)
+        self.text(x + 4, y + 12, title, 18, bold=True, width=w)
+        top = y + 48
+        if subtitle:
+            self.text(x + 4, y + 40, subtitle, 11, italic=True, width=w)
+            top = y + 74
+        for i, (name, var, kind) in enumerate(rows):
+            ry = top + i * 34
+            self.text(x + 4, ry + 2, name, 12, italic=True, width=110)
+            if kind == "status":
+                self.dev_dots[key] = self.cv.create_oval(x + 118, ry + 6, x + 130, ry + 18, fill="#8c7b62",
+                                                         outline="#5a4a30", tags="page")
+                self.label(self.vars[var], x + 138, ry, 12, bg=CARD, width=w - 140)
+            elif kind == "battery":
+                self.label(self.vars[var], x + 118, ry, 12, bg=CARD, width=50)
+                bx, by, bw, bh = x + 176, ry + 6, 110, 12
+                self.cv.create_rectangle(bx, by, bx + bw, by + bh, outline="#8a6b3a", fill=FIELD, tags="page")
+                fid = self.cv.create_rectangle(bx + 1, by + 1, bx + 1, by + bh - 1, fill="#3aa655", outline="",
+                                               tags="page", state="hidden")
+                self.batt_bars[key] = (bx, by, bw, bh, fid)
+            else:
+                self.label(self.vars[var], x + 118, ry, 12, bg=CARD, width=w - 120)
+        by = top + len(rows) * 34 + 10
+        self.button("Connect", on_connect, x + 4, by, bg=CARD, tip="Find and connect to this device")
+        self.button("Disconnect", on_disconnect, x + 112, by, bg=CARD,
+                    tip="Disconnect and stop reconnecting until you press Connect again")
+
+    def _page_devices(self):
+        self.text(LX, BY0 + 14, "Magic Caster\nCompanion", 28, bold=True, italic=True, color=RED)
+        self.ornament(LX, BY0 + 118)
+        self._device_card("w", LX, BY0 + 138, PAGE_W - 20, 224, "The Wand", None,
+                          [("Status", "w_state", "status"), ("Model", "w_info", "text"),
+                           ("Battery", "w_batt", "battery")],
+                          lambda: self.connect("wand"), lambda: self.disconnect("wand"))
+        self.button("Connect wand & base", self.connect_all, LX, BY0 + 382,
+                    tip="Scan, then connect both devices. They reconnect automatically if the link drops.")
+        self.button("Scan only", self.do_scan, LX + 226, BY0 + 382, tip="List nearby devices in the Notes page")
+        # quick start
+        self.card(LX - 14, BY0 + 438, LX + PAGE_W - 6, BY0 + 628)
+        self.text(LX + 4, BY0 + 450, "Getting started", 14, bold=True, color=RED)
+        steps = ("1   Wave the wand to wake it.\n2   Press Connect wand & base.\n"
+                 "3   Open Spells to see how each spell is cast.\n4   Open Cast and teach the book your motion.")
+        self.text(LX + 4, BY0 + 480, steps, 11, width=PAGE_W - 20)
+
+        self._device_card("b", RX, BY0 + 20, PAGE_W - 20, 372, "The Base", "Magic Caster Box",
+                          [("Status", "b_state", "status"), ("Firmware", "b_info", "text"),
+                           ("Battery", "b_batt", "battery"), ("Lid", "b_lid", "text"),
+                           ("Wand in base", "b_wand", "text"), ("USB power", "b_usb", "text")],
+                          lambda: self.connect("box"), lambda: self.disconnect("box"))
+        try:
+            crest = Image.open(resource_path(os.path.join("assets", "icon.ico"))).convert("RGBA").resize(
+                (120, 120), Image.LANCZOS)
+            self._crest = ImageTk.PhotoImage(crest)
+            self.cv.create_image(RX + (PAGE_W - 20) // 2, BY0 + 412, image=self._crest, anchor="n", tags="page")
+        except (OSError, ValueError):
+            pass
+        self.text(RX + (PAGE_W - 20) // 2, BY0 + 548, "An unofficial, community-made companion", 10, italic=True,
+                  anchor="n", width=300)
+        self.text(RX + (PAGE_W - 20) // 2, BY0 + 568, f"Version {__version__}", 10, italic=True, anchor="n",
+                  color="#7a6a4a")
 
     # ---------- page: spells ----------
     def _page_spells(self):
@@ -351,23 +408,27 @@ class App(tk.Tk):
                   italic=True)
         self.spell_filter = tk.StringVar()
         ent = tk.Entry(self, textvariable=self.spell_filter, bg=FIELD, fg=INK, relief="flat",
-                       font=(SERIF, 12), highlightthickness=1, highlightbackground=PARCH_DARK, width=34)
+                       font=(SERIF, 12), highlightthickness=1, highlightbackground=PARCH_DARK,
+                       highlightcolor=GOLD, insertbackground=INK, width=34)
         self.put(ent, LX, BY0 + 90)
+        Tip(ent, "Type to filter the list")
         self.spell_filter.trace_add("write", lambda *_: self._fill_spells())
         frame = tk.Frame(self, bg=PARCH)
-        sb = tk.Scrollbar(frame)
+        sb = ttk.Scrollbar(frame, orient="vertical", style="Book.Vertical.TScrollbar")
         self.spell_list = tk.Listbox(frame, bg=PARCH, fg=INK, font=(SERIF, 12), bd=0, highlightthickness=0,
                                      selectbackground="#c9a96a", selectforeground=INK, activestyle="none",
                                      height=21, width=33, yscrollcommand=sb.set, exportselection=False)
-        sb.config(command=self.spell_list.yview)
+        sb.configure(command=self.spell_list.yview)
         self.spell_list.pack(side="left")
         sb.pack(side="right", fill="y")
         self.put(frame, LX, BY0 + 128)
         self.spell_list.bind("<<ListboxSelect>>", self._spell_selected)
         self._fill_spells()
-        self.button("Play effect", self.play_selected, RX, BY0 + 530)
-        self.button("Teach this spell", lambda: self.show("cast"), RX + 130, BY0 + 530)
-        self.button("Actions & colour...", self._action_dialog, RX, BY0 + 575)
+        self.button("Play effect", self.play_selected, RX, BY0 + 530, tip="Show this spell's light and buzz on the wand")
+        self.button("Teach this spell", lambda: self.show("cast"), RX + 124, BY0 + 530,
+                    tip="Go to the Cast page to record your own casts of this spell")
+        self.button("Actions & colour...", self._action_dialog, RX, BY0 + 578,
+                    tip="Choose this spell's light colour and what it does on your PC")
         self._draw_spell_detail()
 
     def _fill_spells(self):
@@ -393,6 +454,7 @@ class App(tk.Tk):
         x = RX
         tg = ("page", "detail")
         self.text(x, BY0 + 24, pretty(s), 22, bold=True, italic=True, color=RED, tags=tg)
+        self.cv.create_line(x, BY0 + 88, x + PAGE_W, BY0 + 88, fill="#9a7b45", tags=tg)
         desc = DESCRIPTIONS.get(s, "A spell from the Magic Caster Wand's repertoire.")
         self.text(x, BY0 + 100, desc, 11, italic=True, tags=tg)
         paths = diagram_paths(s)
@@ -428,28 +490,33 @@ class App(tk.Tk):
         self.cast_combo.set(pretty(self.sel_spell))
         self.cast_combo.bind("<<ComboboxSelected>>", self._cast_pick)
         self.put(self.cast_combo, LX, BY0 + 126)
-        self.button("Record 3 casts", lambda: self.arm_record(3), LX, BY0 + 166)
-        self.button("Record 1 cast", lambda: self.arm_record(1), LX + 150, BY0 + 166)
-        self.check("Recognise my casts and play the effect", self.cast_mode, LX, BY0 + 214)
+        self.button("Record 3 casts", lambda: self.arm_record(3), LX, BY0 + 164,
+                    tip="Cast the spell three times. The book learns your motion and rejects stray ones.")
+        self.button("Record 1 cast", lambda: self.arm_record(1), LX + 148, BY0 + 164,
+                    tip="Add a single cast to this spell")
+        self.check("Recognise my casts and play the effect", self.cast_mode, LX, BY0 + 212)
         self.check("Test mode (recognise only, run no actions)", self.test_mode, LX, BY0 + 238,
                    lambda: self.settings.set("test_mode", bool(self.test_mode.get())))
-        sc = tk.Scale(self, from_=0.3, to=2.0, resolution=0.05, orient="horizontal", variable=self.accept_var,
-                      length=250, bg=PARCH, fg=INK, troughcolor=FIELD, highlightthickness=0, font=(SERIF, 10),
-                      label="Sensitivity limit (lower is stricter)")
-        sc.bind("<ButtonRelease-1>", lambda _e: self.settings.set("accept", round(float(self.accept_var.get()), 2)))
-        self.put(sc, LX, BY0 + 272)
-        self.button("Auto-tune", self.autotune, LX + 270, BY0 + 292)
-        self.rule(LX, BY0 + 345)
-        self.text(LX, BY0 + 352, "Spells you have taught", 13, bold=True)
+        self.slider(LX, BY0 + 270, "Sensitivity limit (lower is stricter)", float(self.accept_var.get()), 0.3, 2.0,
+                    0.05, 190, lambda v: f"{v:.2f}", on_change=lambda v: self.accept_var.set(round(v, 2)),
+                    on_release=lambda: self.settings.set("accept", round(float(self.accept_var.get()), 2)))
+        self.button("Auto-tune", self.autotune, LX + 286, BY0 + 280,
+                    tip="Set the limit from a self-test of your own recorded casts")
+        self.ornament(LX, BY0 + 338)
+        self.text(LX, BY0 + 350, "Spells you have taught", 13, bold=True)
         self.g_list = tk.Listbox(self, bg=PARCH, fg=INK, font=(SERIF, 12), bd=0, highlightthickness=0,
                                  selectbackground="#c9a96a", selectforeground=INK, activestyle="none",
-                                 height=7, width=33, exportselection=False)
-        self.put(self.g_list, LX, BY0 + 382)
+                                 height=6, width=33, exportselection=False)
+        self.put(self.g_list, LX, BY0 + 380)
+        self.g_win = self.last_win
+        self.empty_item = self.text(LX + 4, BY0 + 392, "None yet. Pick a spell above and press\nRecord 3 casts.",
+                                    11, italic=True, color="#7a6a4a", width=PAGE_W - 10)
         self._fill_gestures()
-        self.button("Forget", self.delete_gesture, LX, BY0 + 566)
-        self.button("Export", self.export_gestures, LX + 88, BY0 + 566)
-        self.button("Import", self.import_gestures, LX + 176, BY0 + 566)
-        self.button("Check", self.check_casts, LX + 264, BY0 + 566)
+        self.button("Forget", self.delete_gesture, LX, BY0 + 566, tip="Forget the selected spell's casts")
+        self.button("Export", self.export_gestures, LX + 92, BY0 + 566, tip="Save your casts to a file to share")
+        self.button("Import", self.import_gestures, LX + 184, BY0 + 566, tip="Add casts from a shared file")
+        self.button("Check", self.check_casts, LX + 276, BY0 + 566,
+                    tip="Self-test: how reliably are your recorded casts told apart?")
 
         self.text(RX, BY0 + 24, "The Last Cast", 20, bold=True)
         self.status_item = self.text(RX, BY0 + 64, self.g_status.get(), 15, bold=True, italic=True, color=RED,
@@ -487,14 +554,20 @@ class App(tk.Tk):
         self.g_list.delete(0, "end")
         for n, s in sorted(self.store.data.items()):
             self.g_list.insert("end", f"{pretty(n)}  ({len(s)} casts)")
+        try:  # the list is hidden while empty so the hint text underneath shows
+            self.cv.itemconfig(self.g_win, state="normal" if self.store.data else "hidden")
+            if self.empty_item is not None:
+                self.cv.itemconfig(self.empty_item, state="hidden" if self.store.data else "normal")
+        except (tk.TclError, AttributeError):
+            pass
 
     # ---------- page: lights ----------
     def _page_lights(self):
         self.text(LX, BY0 + 20, "Light & Sound", 24, bold=True, italic=True, color=RED)
         self.text(LX, BY0 + 62, "Colour the lights along the wand and the base.", 10, italic=True)
-        self.swatch = tk.Label(self, width=14, height=3, bg=hexcolor(self.color), relief="sunken")
+        self.swatch = tk.Label(self, width=14, height=3, bg=hexcolor(self.color), relief="solid", bd=1)
         self.put(self.swatch, LX, BY0 + 110)
-        self.button("Pick colour", self.pick_color, LX + 170, BY0 + 120)
+        self.button("Pick colour", self.pick_color, LX + 170, BY0 + 124)
         self.text(LX, BY0 + 200, "Wand light", 12, bold=True)
         self.group = ttk.Combobox(self, style="Book.TCombobox", values=list(LED_GROUPS) + ["All"],
                                   state="readonly", width=16, font=(SERIF, 11))
@@ -508,18 +581,15 @@ class App(tk.Tk):
         self.text(RX, BY0 + 24, "Buzz", 20, bold=True)
         self.text(RX, BY0 + 62, "Make the wand vibrate for a moment.", 10, italic=True)
         self.buzz_ms = tk.IntVar(value=300)
-        sc = tk.Scale(self, from_=50, to=2000, orient="horizontal", variable=self.buzz_ms, length=300,
-                      bg=PARCH, fg=INK, troughcolor=FIELD, highlightthickness=0, font=(SERIF, 10),
-                      label="Length (milliseconds)")
-        self.put(sc, RX, BY0 + 100)
-        self.button("Buzz", lambda: self.wand_call("buzz", int(self.buzz_ms.get())), RX, BY0 + 190)
-        self.rule(RX, BY0 + 260)
-        self.text(RX, BY0 + 275, "Preferences", 18, bold=True)
+        self.slider(RX, BY0 + 100, "Length", 300, 50, 2000, 50, 280, lambda v: f"{int(v)} ms",
+                    on_change=lambda v: self.buzz_ms.set(int(v)))
+        self.button("Buzz", lambda: self.wand_call("buzz", int(self.buzz_ms.get())), RX, BY0 + 170)
+        self.ornament(RX, BY0 + 252)
+        self.text(RX, BY0 + 268, "Preferences", 18, bold=True)
         for i, (key, label) in enumerate([("sounds", "Sound effects on this PC"),
                                           ("auto_reconnect", "Connect and reconnect automatically"),
                                           ("base_status_light", "Show wand status on the base's light")]):
-            self.check(label, self.pref_vars[key], RX, BY0 + 315 + i * 32,
-                       lambda k=key: self._pref_changed(k))
+            self.check(label, self.pref_vars[key], RX, BY0 + 312 + i * 32, lambda k=key: self._pref_changed(k))
 
     def _pref_changed(self, key):
         self.settings.set(key, bool(self.pref_vars[key].get()))
@@ -533,7 +603,8 @@ class App(tk.Tk):
         self.text(LX, BY0 + 20, "Notes", 24, bold=True, italic=True, color=RED)
         self.text(LX, BY0 + 62, "What the book has been up to.", 10, italic=True)
         self.logbox = tk.Text(self, width=40, height=26, bg=FIELD, fg=INK, font=(SERIF, 10), relief="flat",
-                              wrap="word", state="disabled")
+                              wrap="word", state="disabled", padx=8, pady=6, highlightthickness=1,
+                              highlightbackground=PARCH_DARK)
         self.put(self.logbox, LX, BY0 + 92)
         self.logbox.configure(state="normal")
         self.logbox.insert("end", "\n".join(self.log_lines) + ("\n" if self.log_lines else ""))
@@ -542,14 +613,16 @@ class App(tk.Tk):
 
         self.text(RX, BY0 + 24, "About", 20, bold=True)
         self.text(RX, BY0 + 56, f"Version {__version__}", 10, italic=True)
-        self.text(RX, BY0 + 84,
+        self.ornament(RX, BY0 + 84)
+        self.text(RX, BY0 + 100,
                   "Magic Caster Companion is an unofficial, community-made replacement for the discontinued "
                   "app. It is not affiliated with or endorsed by the makers of the Magic Caster Wand.\n\n"
                   "The protocol was learned by probing real devices and from the MIT-licensed "
                   "hass-magic-caster-wand project by eigger, whose spell diagrams are also used here.\n\n"
-                  "Your recorded casts, colours and actions are kept in your user profile.", 11)
+                  "Your recorded casts, colours and actions are kept in your user profile.\n\n"
+                  "Shortcuts: Ctrl+1 to Ctrl+5 turn to each page.", 11)
         self.button("Open data folder", lambda: os.startfile(DATA_DIR) if os.path.isdir(DATA_DIR) else None,
-                    RX, BY0 + 470)
+                    RX, BY0 + 500, tip="Where your casts, colours and settings are stored")
 
     # ---------- connecting ----------
     def _fresh(self, kind):
@@ -722,13 +795,14 @@ class App(tk.Tk):
         dlg.configure(bg=PARCH)
         dlg.resizable(False, False)
         dlg.transient(self)
+        dlg.after(100, lambda: style_titlebar(dlg))
         color = list(self.settings.color(spell) or spell_color(spell))
         act = self.settings.action(spell) or {"type": "None", "value": ""}
         lab = dict(bg=PARCH, fg=INK, font=(SERIF, 11), anchor="w")
         tk.Label(dlg, text=pretty(spell), bg=PARCH, fg=RED, font=(SERIF, 20, "bold italic")).grid(
             row=0, column=0, columnspan=3, sticky="w", padx=16, pady=(12, 4))
         tk.Label(dlg, text="Light colour", **lab).grid(row=1, column=0, sticky="w", padx=16, pady=6)
-        sw = tk.Label(dlg, width=8, bg=hexcolor(color), relief="sunken")
+        sw = tk.Label(dlg, width=8, bg=hexcolor(color), relief="solid", bd=1)
         sw.grid(row=1, column=1, sticky="w")
 
         def pick():
@@ -752,7 +826,8 @@ class App(tk.Tk):
         typ.grid(row=2, column=1, columnspan=2, sticky="w")
         val = tk.StringVar(value=act["value"])
         ent = tk.Entry(dlg, textvariable=val, width=52, bg=FIELD, fg=INK, relief="flat", font=(SERIF, 11),
-                       highlightthickness=1, highlightbackground=PARCH_DARK)
+                       highlightthickness=1, highlightbackground=PARCH_DARK, highlightcolor=GOLD,
+                       insertbackground=INK)
         ent.grid(row=3, column=0, columnspan=3, padx=16, pady=4, sticky="we")
         hint = tk.Label(dlg, text="", wraplength=470, justify="left", bg=PARCH, fg=INK, font=(SERIF, 10, "italic"))
         hint.grid(row=4, column=0, columnspan=3, padx=16, sticky="w")
@@ -918,6 +993,9 @@ class App(tk.Tk):
         self.accept_var.set(s)
         self.settings.set("accept", s)
         self.g_status.set(f"Self-test: {chk['correct']} of {chk['total']} recognised. Sensitivity limit set to {s}.")
+        if self.page == "cast":  # redraw so the slider moves to the new value
+            self.clear()
+            self._build("cast")
 
     def check_casts(self):
         chk = self.store.self_check()
@@ -970,7 +1048,7 @@ class App(tk.Tk):
         self.destroy()
 
 
-def _screenshots(app: App, outdir: str):
+def _screenshots(app: App, outdir: str, demo: bool = True):
     """Developer helper: save a PNG of every page (and the actions dialog) for the README."""
     from PIL import ImageGrab
     os.makedirs(outdir, exist_ok=True)
@@ -985,12 +1063,18 @@ def _screenshots(app: App, outdir: str):
                w.winfo_rooty() + w.winfo_height())
         ImageGrab.grab(bbox=box).save(os.path.join(outdir, f"{name}.png"))
 
+    if demo:  # realistic-looking sample state for the documentation
+        for k, v in (("w_state", "connected"), ("w_info", "Heroic wand (fw 0.3)"), ("w_batt", "82%"),
+                     ("b_state", "connected"), ("b_info", "32.1"), ("b_batt", "100%"), ("b_lid", "removed"),
+                     ("b_wand", "no"), ("b_usb", "unplugged")):
+            app.vars[k].set(v)
+
     def grab(i=0):
         if i >= len(keys):
             app.sel_spell = "expelliarmus"
             app._action_dialog()
             app.update()
-            app.after(400, lambda: (snap("dialog", app._dlg), app.destroy()))
+            app.after(500, lambda: (snap("dialog", app._dlg), app.destroy()))
             return
         app.page = keys[i]
         app._mark_tab(keys[i])
@@ -1008,8 +1092,8 @@ def _screenshots(app: App, outdir: str):
             app.cv.itemconfig(app.scores_item,
                               text="Closest:\nExpelliarmus  0.41\nStupefy  0.88\nProtego  1.12\nlimit 0.90")
         app.update()
-        app.after(400, lambda: (snap(keys[i]), grab(i + 1)))
-    app.after(800, grab)
+        app.after(500, lambda: (snap(keys[i]), grab(i + 1)))
+    app.after(900, grab)
 
 
 def _selftest(outfile):

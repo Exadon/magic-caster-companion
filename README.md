@@ -7,12 +7,15 @@ from a Windows PC. No firmware is changed.
 > Unofficial and not affiliated with Warner Bros., the Wizarding World, or the wand's makers. See
 > [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
+![The Devices page with wand and base status](docs/screenshots/devices.png)
+
 ![The spell index with the Expelliarmus gesture diagram](docs/screenshots/spells.png)
 
 ## What it does
 
-The app looks like a spell book, with a ribbon tab for each page. A status line along the bottom always shows
-whether the wand and base are connected.
+The app looks like a spell book, with a ribbon tab for each page (or press Ctrl+1 to Ctrl+5). A status line along
+the bottom always shows, with a coloured dot, whether the wand and base are connected. Hover over any button for a
+hint.
 
 | Page | What's on it |
 |---|---|
