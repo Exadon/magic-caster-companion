@@ -47,7 +47,7 @@ class _Device:
         self.address = address
         self.cmd_uuid = f"57420002-{self.SERVICE_TAIL}"
         self.notify_uuid = f"57420003-{self.SERVICE_TAIL}"
-        self._c = BleakClient(address, timeout=20, disconnected_callback=self._lost)
+        self._c = BleakClient(address, timeout=12, disconnected_callback=self._lost)
         self.on_disconnect: Optional[Callable[[], None]] = None
         self.firmware: Optional[str] = None
         self.battery: Optional[int] = None
@@ -76,8 +76,8 @@ class _Device:
             except (BleakError, asyncio.TimeoutError) as e:
                 last = e
                 # Re-find the device (it may have stopped advertising) and retry.
-                dev = await BleakScanner.find_device_by_address(self.address, timeout=10)
-                self._c = BleakClient(dev or self.address, timeout=20, disconnected_callback=self._lost)
+                dev = await BleakScanner.find_device_by_address(self.address, timeout=6)
+                self._c = BleakClient(dev or self.address, timeout=12, disconnected_callback=self._lost)
         else:
             raise last or BleakError("connect failed")
         # Subscribe first: devices drop idle links that never subscribe.

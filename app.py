@@ -4,6 +4,7 @@ import os
 import queue
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import colorchooser, messagebox, ttk
 
@@ -76,6 +77,7 @@ class App(tk.Tk):
         self.wand: Wand | None = None
         self.box: Box | None = None
         self.found = {}
+        self.found_at = 0.0
         self.color = (255, 200, 80)
         self.sel_spell = "lumos" if "lumos" in SPELLS else SPELLS[0]
         self.spin = 0.0
@@ -138,7 +140,7 @@ class App(tk.Tk):
             if exc:
                 self.ui(lambda: self.log(f"Error: {type(exc).__name__}: {exc}"))
                 if failed:
-                    self.ui(failed)
+                    self.ui(lambda: failed(exc))
             elif done:
                 self.ui(lambda: done(f.result()))
         fut.add_done_callback(cb)
@@ -483,28 +485,43 @@ class App(tk.Tk):
 
     def _scanned(self, found):
         self.found = found
+        self.found_at = time.monotonic()
         self.log("Found: " + (", ".join(f"{v['name']} ({v['rssi']} dBm)" for v in found.values()) or "nothing"))
         if not found:
             self.log("Wake the wand or base (lift the wand from the base, give it a wave) and scan again.")
 
-    def _need_found(self, kind):
+    def _need_found_unused(self, kind):
         if kind not in self.found:
             self.log(f"No {kind} found yet - press Scan first.")
             return None
         return self.found[kind]["address"]
 
+    def _fresh(self, kind):
+        """Return the scan result for kind, rescanning first if it is missing or stale (coroutine)."""
+        async def go():
+            info = self.found.get(kind)
+            if not info or time.monotonic() - self.found_at > 30:
+                found = await scan(6)
+                self.ui(lambda: self._scanned(found))
+                info = found.get(kind)
+            if not info:
+                raise RuntimeError(f"{kind} not found - wake it (wave it), and close any other window already connected to it")
+            return info
+        return go()
+
     def connect_wand(self):
-        addr = self._need_found("wand")
-        if not addr or (self.wand and self.wand.connected):
+        if self.wand and self.wand.connected:
             return
-        self.vars["w_state"].set("connecting...")
-        w = Wand(addr)
-        w.on_imu = self._on_imu
-        w.on_touch = lambda m: self.ui(lambda: self.log(f"Wand touch sensors: {m:04b}"))
-        w.on_spell = lambda n: self.ui(lambda: self.log(f"Wand reported spell: {n}"))
-        w.on_disconnect = lambda: self.ui(self._wand_lost)
+        self.vars["w_state"].set("looking for the wand...")
 
         async def go():
+            info = await self._fresh("wand")
+            self.ui(lambda: self.vars["w_state"].set("connecting..."))
+            w = Wand(info["address"])
+            w.on_imu = self._on_imu
+            w.on_touch = lambda m: self.ui(lambda: self.log(f"Wand touch sensors: {m:04b}"))
+            w.on_spell = lambda n: self.ui(lambda: self.log(f"Wand reported spell: {n}"))
+            w.on_disconnect = lambda: self.ui(self._wand_lost)
             await w.connect()
             await w.imu_start()
             return w
@@ -515,7 +532,7 @@ class App(tk.Tk):
             self.vars["w_info"].set(f"{w.model} (fw {w.firmware})")
             self.vars["w_batt"].set(f"{w.battery}%")
             self.log("Wand connected, motion streaming.")
-        self.run(go(), ok, lambda: self.vars["w_state"].set("failed - wake the wand and retry"))
+        self.run(go(), ok, lambda e: self.vars["w_state"].set(f"failed: {e or type(e).__name__}"))
 
     def _wand_lost(self):
         self.vars["w_state"].set("disconnected")
@@ -526,24 +543,29 @@ class App(tk.Tk):
             self.run(self.wand.disconnect())
 
     def connect_box(self):
-        addr = self._need_found("box")
-        if not addr or (self.box and self.box.connected):
+        if self.box and self.box.connected:
             return
-        self.vars["b_state"].set("connecting...")
-        b = Box(addr)
-        b.on_lid = lambda x: self.ui(lambda: self.vars["b_lid"].set("removed" if x else "on"))
-        b.on_wand = lambda x: self.ui(lambda: self.vars["b_wand"].set("yes" if x else "no"))
-        b.on_charge = lambda x: self.ui(lambda: self.vars["b_usb"].set("plugged in" if x else "unplugged"))
-        b.on_disconnect = lambda: self.ui(lambda: (self.vars["b_state"].set("disconnected"),
-                                                   self.log("Base disconnected.")))
+        self.vars["b_state"].set("looking for the base...")
 
-        def ok(_):
+        async def go():
+            info = await self._fresh("box")
+            self.ui(lambda: self.vars["b_state"].set("connecting..."))
+            b = Box(info["address"])
+            b.on_lid = lambda x: self.ui(lambda: self.vars["b_lid"].set("removed" if x else "on"))
+            b.on_wand = lambda x: self.ui(lambda: self.vars["b_wand"].set("yes" if x else "no"))
+            b.on_charge = lambda x: self.ui(lambda: self.vars["b_usb"].set("plugged in" if x else "unplugged"))
+            b.on_disconnect = lambda: self.ui(lambda: (self.vars["b_state"].set("disconnected"),
+                                                       self.log("Base disconnected.")))
+            await b.connect()
+            return b
+
+        def ok(b):
             self.box = b
             self.vars["b_state"].set("connected")
             self.vars["b_info"].set(b.firmware or "-")
             self.vars["b_batt"].set(f"{b.battery}%")
             self.log("Base connected.")
-        self.run(b.connect(), ok, lambda: self.vars["b_state"].set("failed - retry"))
+        self.run(go(), ok, lambda e: self.vars["b_state"].set(f"failed: {e or type(e).__name__}"))
 
     def disconnect_box(self):
         if self.box:
@@ -667,7 +689,30 @@ def _screenshots(app: App, outdir: str):
     app.after(800, grab)
 
 
+def _selftest(outfile: str):
+    """Headless BLE check for the packaged EXE: scan, connect to the wand, write the result to a file."""
+    import traceback
+
+    async def go(f):
+        found = await scan(8)
+        f.write(f"scan: {found}\n")
+        f.flush()
+        if "wand" in found:
+            async with Wand(found["wand"]["address"]) as w:
+                f.write(f"connected: model={w.model} fw={w.firmware} battery={w.battery}\n")
+
+    with open(outfile, "w", encoding="utf-8") as f:
+        try:
+            asyncio.run(go(f))
+            f.write("OK\n")
+        except Exception:
+            f.write("FAILED\n" + traceback.format_exc())
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 2 and sys.argv[1] == "--selftest":
+        _selftest(sys.argv[2])
+        sys.exit(0)
     try:
         import ctypes
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
