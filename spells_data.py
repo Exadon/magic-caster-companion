@@ -1,6 +1,7 @@
 """Spell catalogue: names, short descriptions, gesture diagrams, light/buzz effects."""
 import colorsys
 import hashlib
+import re
 import os
 import sys
 
@@ -83,6 +84,11 @@ CAST_STEPS = (
     "4. Use big, deliberate motions: the wand senses movement, not where it points.\n"
     "5. The book learns from you: record a few casts of each spell on the Cast page."
 )
+
+
+def spell_key(name: str) -> str:
+    """Normalise a spell name from the wand ('Wingardium Leviosa', 'The_Stretching_Jinx') to our ids."""
+    return re.sub(r"[^a-z0-9]+", "_", (name or "").lower()).strip("_")
 
 
 def pretty(s: str) -> str:

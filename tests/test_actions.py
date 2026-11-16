@@ -92,3 +92,10 @@ def test_page_turn_sound_swells_then_fades():
     rms = lambda seg: (sum(v * v for v in seg) / len(seg)) ** 0.5
     assert rms(s[int(n * .1):int(n * .3)]) > 2 * rms(s[int(n * .85):])   # louder in the swell than at the end
     assert rms(s[:int(n * .02)]) < rms(s[int(n * .1):int(n * .3)])       # starts soft
+
+
+def test_streaming_setting_defaults_on(tmp_path):
+    s = S.Settings(str(tmp_path / "s.json"))
+    assert s.get("streaming") is True
+    s.set("streaming", False)
+    assert S.Settings(str(tmp_path / "s.json")).get("streaming") is False

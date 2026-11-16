@@ -19,7 +19,7 @@ from gestures import UNLOCK_AT
 from mcwand import Box, LED_GROUPS, Wand, scan
 from settings import DATA_DIR, Settings
 from spells_data import (CAST_STEPS, DESCRIPTIONS, SPELLS, diagram_paths, pretty, resource_path,
-                         spell_color, spell_effect)
+                         spell_color, spell_effect, spell_key)
 from ui_kit import (CARD, CARD_EDGE, FIELD, GOLD, INK, LEATHER, PARCH, PARCH_DARK, RED, SERIF,
                     RoundButton, Tip, apply_styles, battery_color, battery_percent, ink_image, make_leather,
                     make_page, state_color, style_titlebar, tab_pil)
@@ -103,6 +103,7 @@ class App(tk.Tk):
         self.accept_var = tk.DoubleVar(value=self.settings.get("accept"))
         self.pref_vars = {k: tk.BooleanVar(value=self.settings.get(k))
                           for k in ("sounds", "auto_reconnect", "base_status_light")}
+        self.stream_var = tk.BooleanVar(value=self.settings.get("streaming"))
         self.chip_font = None
         apply_styles(self)
 
@@ -193,7 +194,8 @@ class App(tk.Tk):
         if len(pts) >= 4:
             c.create_line(*pts, fill=RED, width=2, smooth=True)
         else:
-            c.create_text(w / 2, h / 2, text="waiting for the wand", fill=MUTED, font=(SERIF, 11, "italic"))
+            msg = "motion streaming is off" if not self.settings.get("streaming") else "waiting for the wand"
+            c.create_text(w / 2, h / 2, text=msg, fill=MUTED, font=(SERIF, 11, "italic"))
 
     def _set_item(self, attr, text, page):
         item = getattr(self, attr)
@@ -635,6 +637,10 @@ class App(tk.Tk):
         self.put(self.scope, SX0, BY0 + 122)
         self.text(SX0, BY0 + 252, "How fast the wand is turning, over the last few seconds. A cast starts when "
                   "the line rises above the gold mark.", 10, italic=True, width=250)
+        stream = self.check("Stream motion (for my own spells)", self.stream_var, SX0, BY0 + 316,
+                            self._streaming_changed)
+        Tip(stream, "On: the book learns and recognises spells you teach it. Off: only the spells the wand "
+                    "recognises by itself are reported.")
         self.card(SX0 + 280, BY0 + 90, SX1, BY0 + 330)
         self._draw_cast_live()
         self.ornament(SX0, BY0 + 352, SX1 - SX0)
@@ -669,13 +675,24 @@ class App(tk.Tk):
             self.text(mid, y0 + 130, msg, 11, italic=True, color=MUTED, anchor="n", width=440, tags=tg)
             return
         near = ", ".join(f"{pretty(n)} {d:.2f}" for n, d in lc["near"][:3])
+        native = bool(lc.get("native"))
+        if native and not lc["name"]:
+            self.text(mid, y0 + 50, str(lc["raw"]), 30, bold=True, italic=True, color=RED, anchor="n", width=480,
+                      tags=tg)
+            self.text(mid, y0 + 130, "Recognised by the wand itself. This book has no diagram for that spell.",
+                      11, italic=True, color=MUTED, anchor="n", width=440, tags=tg)
+            return
         if lc["name"]:
             n = lc["name"]
             self.text(x0 + 24, y0 + 22, pretty(n), 32, bold=True, italic=True, color=RED, width=330, tags=tg)
             self.text(x0 + 24, y0 + 108, DESCRIPTIONS.get(n, ""), 12, italic=True, width=330, tags=tg)
-            self.text(x0 + 24, y0 + 168, f"distance {lc['dist']:.2f}   ·   limit {lc['limit']:.2f}", 10,
-                      color=MUTED, width=330, tags=tg)
-            self.text(x0 + 24, y0 + 190, f"Closest: {near}", 10, color=MUTED, width=330, tags=tg)
+            if native:
+                self.text(x0 + 24, y0 + 168, "✦ Recognised by the wand itself", 11, bold=True, color="#2f6b3a",
+                          width=330, tags=tg)
+            else:
+                self.text(x0 + 24, y0 + 168, f"distance {lc['dist']:.2f}   ·   limit {lc['limit']:.2f}", 10,
+                          color=MUTED, width=330, tags=tg)
+                self.text(x0 + 24, y0 + 190, f"Closest: {near}", 10, color=MUTED, width=330, tags=tg)
             paths = diagram_paths(n)
             if paths:
                 self._live_img = ink_image(paths[0], 118)
@@ -692,13 +709,14 @@ class App(tk.Tk):
             self.text(SX0, BY0 + 400, "Your casts will be listed here.", 11, italic=True, color=MUTED, tags=tg,
                       width=380)
             return
-        for i, (clock, name, dist) in enumerate(reversed(self.cast_log[-8:])):
+        for i, (clock, name, dist, src) in enumerate(reversed(self.cast_log[-8:])):
             y = BY0 + 400 + i * 24
             if name:
                 self.text(SX0, y, f"{clock}   ✦ {pretty(name)}", 12, bold=(i == 0), tags=tg, width=300)
             else:
                 self.text(SX0, y, f"{clock}   not recognised", 12, italic=True, color=MUTED, tags=tg, width=300)
-            self.text(SX0 + 380, y + 2, f"{dist:.2f}", 10, color=MUTED, anchor="ne", tags=tg, width=60)
+            self.text(SX0 + 380, y + 2, "wand" if src == "wand" else f"{dist:.2f}", 10, color=MUTED, anchor="ne",
+                      tags=tg, width=60)
 
     def _draw_chips(self, x, y, w):
         names = self.store.unlocked()
@@ -835,7 +853,7 @@ class App(tk.Tk):
             self.ui(lambda: st.set("connecting..."))
             dev = self._make(kind, info["address"])
             await dev.connect()
-            if kind == "wand":
+            if kind == "wand" and self.settings.get("streaming"):
                 await dev.imu_start()
             return dev
 
@@ -873,7 +891,7 @@ class App(tk.Tk):
             w = Wand(address)
             w.on_imu = self._on_imu
             w.on_touch = lambda m: self.ui(lambda: self.log(f"Wand touch sensors: {m:04b}"))
-            w.on_spell = lambda n: self.ui(lambda: self.log(f"Wand reported spell: {n}"))
+            w.on_spell = lambda n: self.ui(lambda: self._native_spell(n))
             w.on_disconnect = lambda: self.ui(lambda: self._lost("wand"))
             return w
         b = Box(address)
@@ -1105,6 +1123,34 @@ class App(tk.Tk):
             self._flash(r["name"], self.settings.color(r["name"]) or spell_color(r["name"]),
                         f"{pretty(r['name'])} unlocked!")
 
+    def _streaming_changed(self):
+        on = bool(self.stream_var.get())
+        self.settings.set("streaming", on)
+        if not on:
+            self.spin_hist.clear()
+            self.spin = 0.0
+        if self.wand and self.wand.connected:
+            self.wand_call("imu_start" if on else "imu_stop")
+        self.log("Motion streaming on: your taught spells are recognised." if on else
+                 "Motion streaming off: only spells the wand recognises itself are reported.")
+
+    def _native_spell(self, raw):
+        """The wand itself recognised a spell and told us its name."""
+        key = spell_key(raw)
+        known = key in SPELLS
+        self.log(f"Wand recognised: {raw}" + ("" if known else "  (not in this book's list)"))
+        self.last_cast = {"name": key if known else None, "raw": raw, "native": True, "dist": 0.0,
+                          "limit": 0.0, "near": []}
+        self.cast_log.append((time.strftime("%H:%M:%S"), key if known else raw, 0.0, "wand"))
+        self.cast_log = self.cast_log[-50:]
+        if self.page == "cast":
+            self._draw_cast_live()
+            self._draw_history()
+        if known:
+            self._spell_cast(key)
+        else:
+            self.cue("success")
+
     def _cast(self, g):
         if not self.store.data:
             if self.page == "teach":
@@ -1114,7 +1160,7 @@ class App(tk.Tk):
         best, dist, scores = self.store.match(g, accept)
         near = sorted(scores.items(), key=lambda kv: kv[1])[:4]
         self.last_cast = {"name": best, "dist": dist, "limit": accept, "near": near}
-        self.cast_log.append((time.strftime("%H:%M:%S"), best, dist))
+        self.cast_log.append((time.strftime("%H:%M:%S"), best, dist, "book"))
         self.cast_log = self.cast_log[-50:]
         if self.page == "cast":
             self._draw_cast_live()
@@ -1123,6 +1169,10 @@ class App(tk.Tk):
             self.cue("fail")
             return
         self.log(f"Cast {pretty(best)} d={dist:.2f}")
+        self._spell_cast(best)
+
+    def _spell_cast(self, best):
+        """A spell was recognised (by the book or by the wand): sound, glow, wand effect, then its action."""
         self.cue("success")
         col = self.settings.color(best) or spell_color(best)
         if self.page != "cast":          # the Cast page shows the result itself
@@ -1246,8 +1296,9 @@ def _screenshots(app: App, outdir: str, demo: bool = True):
             app.store.data[name] = [blank] * n
         app.last_cast = {"name": "expelliarmus", "dist": 0.41, "limit": 0.9,
                          "near": [("expelliarmus", 0.41), ("stupefy", 0.88), ("protego", 1.12)]}
-        app.cast_log = [("14:02:11", "lumos", 0.33), ("14:02:19", "nox", 0.52), ("14:02:40", None, 1.31),
-                        ("14:03:02", "protego", 0.47), ("14:03:20", "expelliarmus", 0.41)]
+        app.cast_log = [("14:02:11", "lumos", 0.33, "book"), ("14:02:19", "nox", 0.52, "book"),
+                        ("14:02:40", None, 1.31, "book"), ("14:03:02", "protego", 0.0, "wand"),
+                        ("14:03:20", "expelliarmus", 0.41, "book")]
         now = time.monotonic()
         for i in range(60):   # a believable motion trace: rest, one swish, rest
             t = i / 60 * 3.5
