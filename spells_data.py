@@ -123,7 +123,7 @@ def spell_color(name: str):
     return int(r * 255), int(g * 255), int(b * 255)
 
 
-def spell_effect(name: str):
-    r, g, b = spell_color(name)
+def spell_effect(name: str, color=None):
+    r, g, b = color or spell_color(name)
     return [("buzz", 200), ("led", 0, r, g, b, 300), ("led", 1, r // 2, g // 2, b // 2, 250),
             ("delay", 700), ("clear",)]
