@@ -25,10 +25,13 @@ class CastingMixin:
                 self.ui(lambda g=g: self._gesture_done(g))
 
     def _gesture_done(self, g):
+        self._last_swish = time.monotonic()            # any swish can confirm a spell the user just said
         if self.rec:
             self._record_step(g)
         elif self._practice_listening():
             self._practice_cast(g)
+        elif self._voice_consume_swish():
+            pass                                         # a spoken spell was waiting for this swish
         elif self.cast_mode.get():
             self._cast(g)
 

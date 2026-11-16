@@ -113,6 +113,8 @@ class ShellMixin:
                          "No longer starts with Windows.")
 
     def _close(self):
+        if getattr(self, "voice", None):
+            self.voice.stop()                       # make sure the microphone is released
         if self.tray:
             self.tray.stop()
         for d in (self.wand, self.box):

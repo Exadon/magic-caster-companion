@@ -76,6 +76,30 @@ streaming off, so only the wand's own recognition is active (spells you taught t
 Cast page counts how many spells the wand has named, with streaming on and off, so you can see whether both work
 at the same time.
 
+### Voice incantations (opt-in)
+
+Say a spell's name to cast it. It is **off until you turn it on** (Cast page > Voice incantations), and the first
+time it asks for your agreement to use the microphone. Two modes:
+
+| Mode | What it needs |
+|---|---|
+| **Voice + a swish of the wand** (recommended) | You say the spell, and the wand moves (any swish, within about 3 seconds, either order). The shape doesn't matter. The swish stops names spoken in conversation or on TV from casting anything |
+| **Voice only** | Just say the spell. Handy without the wand in your hand |
+
+A spoken spell plays the same effect and runs the same action as any other cast, and if the wand or the book also
+recognised that cast it counts once. Voice is ignored while you are teaching or practising.
+
+- **Offline and private.** Recognition uses Windows' built-in speech recognition on this PC. Nothing is recorded,
+  saved or sent anywhere, and no extra software is needed. A red **Listening** light shows at the bottom of the
+  window whenever the microphone is in use.
+- **How it listens.** The recogniser is given only a short list of spell names (the ones you taught, the wand
+  knows, or gave an action; or all of them if you have fewer than three), so it can't hear anything else.
+  *Confidence needed* sets how sure it must be.
+- **Requirements.** English Windows speech recognition, and microphone access for desktop apps (Windows Settings >
+  Privacy & security > Microphone).
+- **Status.** Tested end to end with synthesised speech: spoken spells were recognised at about 0.99 confidence.
+  Real voices, accents and noisy rooms haven't been tested yet, so expect to adjust *Confidence needed*.
+
 ### Actions
 
 A recognised spell can do more than light the wand. Press **Actions & colour...** on a spell to choose its light
@@ -155,6 +179,7 @@ async with Wand(found["wand"]["address"]) as w:
 | `mcwand.py` | The Bluetooth library for the wand and base |
 | `gestures.py`, `practice.py` | Gesture matching and practice logic |
 | `actions.py`, `sounds.py`, `settings.py` | What a spell can trigger, synthesised sounds, saved settings |
+| `voice.py`, `voicing.py` | Voice incantations: the offline recogniser wrapper and the app behaviour around it |
 | `ui_kit.py`, `spells_data.py`, `winintegration.py` | Visual building blocks, the spell catalogue, Windows integration |
 
 ## Development

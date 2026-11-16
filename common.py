@@ -26,6 +26,9 @@ from ui_kit import (CARD, CARD_EDGE, FIELD, GOLD, INK, LEATHER, PARCH, PARCH_DAR
                     RoundButton, Tip, apply_styles, battery_color, battery_percent, ink_image, make_leather,
                     make_page, state_color, style_titlebar, tab_pil)
 from version import __version__
+from voice import VoiceListener
+from voice import available as voice_available
+from voice import phrase_map
 from winintegration import SingleInstance, Tray, autostart_enabled, set_autostart
 
 W, H = 1000, 730
@@ -43,6 +46,8 @@ TABS = [("devices", "Devices", "#8a2323"), ("spells", "Spells", "#2f6b3a"), ("te
 MARK = {"unlocked": "✦ ", "learning": "◇ ", "locked": "   "}
 FIRE_WINDOW_S = 2.5   # the wand and the book seeing the same cast within this window count as one cast
 STATE_TEXT = {"unlocked": "✦ Unlocked", "learning": "◇ Learning", "locked": "Locked"}
+VOICE_MODES = [("off", "Off"), ("motion", "Voice + a swish of the wand"), ("voice", "Voice only")]
+VOICE_WINDOW_S = 3.0  # a spoken spell and a swish of the wand must happen within this many seconds
 
 
 def hexcolor(rgb):

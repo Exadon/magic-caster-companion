@@ -17,9 +17,11 @@ from pages.practice import PracticePage
 from pages.spells import SpellsPage
 from pages.teach import TeachPage
 from shell import ShellMixin
+from voicing import VoiceMixin
 
 
-class App(ShellMixin, ConnectionMixin, CastingMixin, DevicesPage, SpellsPage, TeachPage, PracticePage, CastPage, LightsPage, NotesPage, tk.Tk):
+class App(ShellMixin, ConnectionMixin, CastingMixin, VoiceMixin, DevicesPage, SpellsPage, TeachPage, PracticePage,
+          CastPage, LightsPage, NotesPage, tk.Tk):
     """The main window: owns the state and drawing surface; the pages and behaviours live in the mixins."""
 
     def __init__(self, start_hidden=False):
@@ -129,6 +131,7 @@ class App(ShellMixin, ConnectionMixin, CastingMixin, DevicesPage, SpellsPage, Te
         if start_hidden:
             self._tray_hinted = True                 # starting minimised at sign-in: no "still running" notice
             self.after(60, self.hide_to_tray)
+        self._voice_init()
         if self.settings.get("auto_reconnect") and not os.environ.get("MCC_NO_AUTOCONNECT"):
             self.after(1200, lambda: self.connect_all(quiet=True))
 
@@ -420,6 +423,9 @@ def _screenshots(app: App, outdir: str, demo: bool = True):
         app.t_status.set("Protego: cast 2 of 3. Make the motion now...")
         app.sel_spell = "protego"
         app.accept_var.set(0.9)       # documentation shows the default, not whatever this PC has saved
+        app.settings.data["voice_mode"] = "motion"          # sample voice state: listening, one spell just heard
+        app.voice_state, app._voice_n, app.voice_last = "listening", 14, ("Lumos", 0.93)
+        app._voice_refresh()
         app.settings.data["wand_known"] = ["protego", "wingardium_leviosa"]
         app.settings.data["native_stats"] = {"streaming_on": 1, "streaming_off": 2}
         app.pstats.spells = {"lumos": {"tries": 5, "hits": 2}, "nox": {"tries": 4, "hits": 4},

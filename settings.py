@@ -9,6 +9,10 @@ DEFAULTS = {
     "sounds": True,
     "auto_reconnect": True,
     "base_status_light": True,
+    "voice_mode": "off",      # off / motion (voice + any swish of the wand) / voice (voice only)
+    "voice_scope": "used",    # used (spells you taught, the wand knows, or gave an action) / all
+    "voice_confidence": 0.7,  # how sure the recogniser must be, 0..1
+    "voice_consented": False, # the user has agreed to the microphone being used
     "close_to_tray": "ask",   # what the window's X button does: ask / tray / quit
     "tray_notify": True,      # tray notification when a spell is recognised while the window is hidden
     "wand_known": [],         # spells the wand has recognised by itself at least once
