@@ -15,7 +15,8 @@ from a Windows PC. No firmware is changed.
 
 The app looks like a spell book, with a ribbon tab for each page (or press Ctrl+1 to Ctrl+5). A status line along
 the bottom always shows, with a coloured dot, whether the wand and base are connected. Hover over any button for a
-hint.
+hint. A soft page-turn sound plays as the pages turn (synthesised in code, so there is no audio file to ship);
+turn sounds off under **Lights > Preferences**.
 
 | Page | What's on it |
 |---|---|

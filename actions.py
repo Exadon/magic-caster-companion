@@ -1,10 +1,15 @@
 """What a recognised spell can trigger on the PC, plus small sound cues. Windows only."""
 import ctypes
 import ctypes.wintypes as wt
+import io
 import json
+import math
 import os
+import random
+import struct
 import subprocess
 import threading
+import wave
 import urllib.request
 import webbrowser
 
@@ -126,10 +131,58 @@ _CUES = {"success": [(660, 90), (880, 90), (1320, 160)], "fail": [(300, 160), (2
          "saved": [(880, 70)], "connect": [(520, 80), (780, 120)]}
 
 
+def page_turn_wav(seed: int = 0, rate: int = 22050, seconds: float = 0.34) -> bytes:
+    """Synthesize a short paper page-turn: fibrous rustle swell, a few crackles, and a soft flap at the end.
+
+    Returns a mono 16-bit WAV file as bytes. Different seeds give slightly different turns.
+    """
+    rnd = random.Random(seed)
+    n = int(rate * seconds)
+    flutter_hz, phase = rnd.uniform(30, 46), rnd.uniform(0, 6.28)
+    crackles = {int(rnd.uniform(0.08, 0.7) * n): rnd.uniform(0.5, 0.9) for _ in range(4)}
+    flap_at = int(0.60 * n)
+    lp, out, decay = 0.0, [], 0
+    amp = 0.0
+    for i in range(n):
+        t = i / n
+        env = t / 0.16 if t < 0.16 else math.exp(-(t - 0.16) * 5.0)          # quick swell, long tail
+        white = rnd.uniform(-1.0, 1.0)
+        lp += 0.18 * (white - lp)
+        x = (white - lp) * (0.65 + 0.35 * math.sin(2 * math.pi * flutter_hz * t + phase))   # high-passed, fibrous
+        if i in crackles:
+            amp = crackles[i]
+        if amp > 0.01:
+            x += amp * rnd.uniform(-1.0, 1.0)
+            amp *= 0.82
+        s = x * env * 0.55
+        k = i - flap_at
+        if 0 <= k < int(0.03 * rate):                                       # soft thump as the page lands
+            s += 0.30 * math.sin(2 * math.pi * 115 * k / rate) * math.exp(-k / (0.008 * rate))
+        out.append(max(-1.0, min(1.0, s)))
+    peak = max(abs(v) for v in out) or 1.0
+    pcm = b"".join(struct.pack("<h", int(v / peak * 0.5 * 32767)) for v in out)   # peak at half scale: not startling
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(pcm)
+    return buf.getvalue()
+
+
+_page_wavs: list = []
+
+
 def play_cue(name: str):
     def go():
         try:
             import winsound
+            if name == "page":
+                if not _page_wavs:
+                    _page_wavs.extend(page_turn_wav(s) for s in (1, 2, 3))
+                # SND_MEMORY cannot be combined with SND_ASYNC, so this plays (blocking) inside the thread
+                winsound.PlaySound(random.choice(_page_wavs), winsound.SND_MEMORY)
+                return
             for f, d in _CUES.get(name, []):
                 winsound.Beep(f, d)
         except Exception:

@@ -260,6 +260,7 @@ class App(tk.Tk):
         self.clear()
         if animate:
             self.busy = True
+            self.cue("page")
             self._flip(0, page)
         else:
             self._build(page)
