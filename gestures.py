@@ -69,6 +69,21 @@ def features(seq: List[List[float]]) -> List[List[float]]:
     return [[g[0] / 8, g[1] / 8, g[2] / 8, g[3], g[4], g[5]] for g in r]
 
 
+NORM_K = 0.4   # rms gyro magnitude after normalisation; keeps distances on the same scale as before
+
+
+def normalize(f: List[List[float]], k: float = NORM_K) -> List[List[float]]:
+    """Compare the SHAPE of a motion, not how hard it was cast.
+
+    Scales the gyro channels so the cast's rms rotation is always k (hard and gentle casts of the same motion then
+    look alike). Accelerometer channels carry posture information and are left alone. Stored casts keep their
+    un-normalised features, so older recordings need no migration.
+    """
+    rms = math.sqrt(sum(p[0] ** 2 + p[1] ** 2 + p[2] ** 2 for p in f) / len(f)) if f else 0.0
+    s = k / rms if rms > 1e-9 else 1.0
+    return [[p[0] * s, p[1] * s, p[2] * s, p[3], p[4], p[5]] for p in f]
+
+
 def dtw(a: List[List[float]], b: List[List[float]], band: int = 8) -> float:
     n, m = len(a), len(b)
     inf = float("inf")
@@ -134,15 +149,15 @@ class GestureStore:
     # ---- recording ----
     def check(self, name: str, seq: List[List[float]]) -> Tuple[bool, str, Optional[float]]:
         """Is this new cast consistent with the ones already recorded for the spell?"""
-        existing = self.data.get(name, [])
+        existing = [normalize(t) for t in self.data.get(name, [])]
         if not existing:
             return True, "", None
-        f = features(seq)
+        f = normalize(features(seq))
         d = min(dtw(f, t) for t in existing)
         # closer to a different spell than to this one? (catches a stray motion contaminating the set)
         for other, ts in self.data.items():
             if other != name and ts:
-                od = min(dtw(f, t) for t in ts)
+                od = min(dtw(f, normalize(t)) for t in ts)
                 if od < d:
                     pretty = other.replace("_", " ").title()
                     return False, f"That cast looks more like {pretty} than this spell.", d
@@ -170,8 +185,8 @@ class GestureStore:
               ) -> Tuple[Optional[str], float, Dict[str, float]]:
         if not self.data:
             return None, float("inf"), {}
-        f = features(seq)
-        scores = {n: min(dtw(f, t) for t in ts) for n, ts in self.data.items()}
+        f = normalize(features(seq))
+        scores = {n: min(dtw(f, normalize(t)) for t in ts) for n, ts in self.data.items()}
         best = min(scores, key=scores.get)
         return (best if scores[best] <= accept else None), scores[best], scores
 
@@ -184,12 +199,13 @@ class GestureStore:
         total = correct = 0
         same_dists: List[float] = []
         confused = []
-        for name, samples in self.data.items():
+        norm = {n: [normalize(t) for t in ts] for n, ts in self.data.items()}
+        for name, samples in norm.items():
             if len(samples) < 2:
                 continue
             for i, s in enumerate(samples):
                 best_n, best_d = None, float("inf")
-                for n2, ts in self.data.items():
+                for n2, ts in norm.items():
                     for j, t in enumerate(ts):
                         if n2 == name and j == i:
                             continue

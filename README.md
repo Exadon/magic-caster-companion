@@ -114,7 +114,8 @@ async with Wand(found["wand"]["address"]) as w:
   the link.
 - The wand streams raw gyroscope and accelerometer samples. In testing it never reported a recognised spell
   itself, so `gestures.py` segments each swish and matches it against your recorded casts with dynamic time
-  warping.
+  warping. Each cast's rotation strength is normalised first, so the shape of a motion is compared, not how hard
+  you cast it (hard and gentle casts of the same spell look alike).
 - The four `0x10` touch-sensor events, LED, buzz, motion and base status messages are implemented. See `mcwand.py`.
 
 ## Development
